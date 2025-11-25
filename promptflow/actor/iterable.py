@@ -1,5 +1,5 @@
 # internal imports.
-from tinyflow.actor.source import Source
+from promptflow.actor.source import Source
 
 
 class Iterable(Source):
@@ -8,14 +8,14 @@ class Iterable(Source):
     Given an iterable creates a source actor.
     """
 
-    def __init__(self, name, iterable, keyvalue: bool = True, **kwargs):
+    def __init__(self, iterable, keyvalue: bool = True, **kwargs):
         """Creates a source actor based on a given iterable.
 
         Args:
             iterable (iterable): data to feed to this actor stream.
             keyvalue (bool): if the iterable is a key-value pair.
         """
-        super().__init__(name=name, **kwargs)
+        super().__init__(name="Iterable:", **kwargs)
         self.python_iterable = iterable
 
         if keyvalue:

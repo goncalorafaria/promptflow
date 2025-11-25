@@ -1,11 +1,11 @@
 
 
 # internal imports.
-from tinyflow.constants import (
+from promptflow.constants import (
     SEP,
 )
 
-from tinyflow.actor import Actor
+from promptflow.actor import Actor
 
 
 

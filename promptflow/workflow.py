@@ -5,7 +5,8 @@ import logging
 from typing import Any, List
 
 # internal imports
-from tinyflow.actor import Actor
+from promptflow.actor import Actor
+from promptflow.process import ProcessUnion
 
 
 class WorkFlow:
@@ -26,7 +27,8 @@ class WorkFlow:
     def forward(self, *args, **kwargs):
         """This function defines the pipeline logic. It must be implemented by any pipeline."""
         raise NotImplementedError()
-
+    
+    
     def show(self, *args, save_img=False, **kwargs):
         """Plots the workflow diagram.
 
@@ -178,3 +180,17 @@ class WorkFlow:
         results = await asyncio.gather(*tasks)
 
         return results[-noutputs:]
+
+
+### I would like to build a function that given some unionprocess turns it into a workflow. 
+
+def convert_to_workflow(process: ProcessUnion) -> WorkFlow:
+    """
+    Given a ProcessUnion, turns it into a Workflow.
+    """
+    
+    class InplaceWorkflow(WorkFlow):
+        def forward(self, *args, **kwargs):
+            return process(*args, **kwargs)
+    
+    return InplaceWorkflow()

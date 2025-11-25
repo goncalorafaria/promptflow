@@ -1,3 +1,3 @@
-from tinyflow.actor import *
-from tinyflow.process import *
-from tinyflow.workflow import *
+from promptflow.actor import *
+from promptflow.process import *
+from promptflow.workflow import *

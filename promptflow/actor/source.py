@@ -3,10 +3,10 @@ import abc
 import logging
 from typing import Any, List, Union
 
-from tinyflow.asynchronous import Queue
+from promptflow.asynchronous import Queue
 
 # internal imports.
-from tinyflow.actor import Actor 
+from promptflow.actor import Actor 
 
 
 class Source(Actor):

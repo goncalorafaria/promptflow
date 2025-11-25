@@ -2,10 +2,10 @@
 import logging
 from typing import Any, List, Union, Dict, Tuple
 
-from tinyflow.asynchronous import Queue
+from promptflow.asynchronous import Queue
 
 # internal imports.
-from tinyflow.constants import (
+from promptflow.constants import (
     BRANCH,
     CTRL,
     DEFAULT_BATCH,
@@ -122,58 +122,58 @@ class Actor:
         else:
             await self.queue.put((key, value))
 
-def __repr__(self) -> str:
-    return self.name
+    def __repr__(self) -> str:
+        return self.name
 
-def __str__(self) -> str:
-    return self.name
+    def __str__(self) -> str:
+        return self.name
 
-async def tolist(self) -> List[Any]:
-    """
-    Consumes the actor stream and appends everything to a list.
+    async def tolist(self) -> List[Any]:
+        """
+        Consumes the actor stream and appends everything to a list.
 
-    Returns:
-        List[Any] : A list of elements of the actor stream.
-    """
+        Returns:
+            List[Any] : A list of elements of the actor stream.
+        """
 
-    results = []
+        results = []
 
-    async for id, data in self.iterable():
-        results.append((id, data))
-        logging.debug(f"Task recovery: instance {id};")
+        async for id, data in self.iterable():
+            results.append((id, data))
+            logging.debug(f"Task recovery: instance {id};")
 
-    return results
+        return results
 
-async def iterable(self, node: Union["Actor", None] = None):
-    """
-    Produces an async iterable for consuming the actor stream.
+    async def iterable(self, node: Union["Actor", None] = None):
+        """
+        Produces an async iterable for consuming the actor stream.
 
-    Args:
-        node (Union["Actor", None]): Node for the iterable.
+        Args:
+            node (Union["Actor", None]): Node for the iterable.
 
-    Yields:
-        key, value : actor stream's key-value pairs.
-    """
-    loop = True
+        Yields:
+            key, value : actor stream's key-value pairs.
+        """
+        loop = True
 
-    if node is None:
-        queue = self.queue
-        total = 1
-    else:
-        assert (
-            node in self.children
-        ), f"The actor {node} is not linked to this actor {self}."
-        queue, _ = self.children[node]
-        total = len(node.parents)
-
-    stopped = 0
-
-    while loop:
-        value = await queue.get()
-
-        if value == STOP:
-            loop = False
+        if node is None:
+            queue = self.queue
+            total = 1
         else:
-            yield value
+            assert (
+                node in self.children
+            ), f"The actor {node} is not linked to this actor {self}."
+            queue, _ = self.children[node]
+            total = len(node.parents)
 
-  
+        stopped = 0
+
+        while loop:
+            value = await queue.get()
+
+            if value == STOP:
+                loop = False
+            else:
+                yield value
+
+    

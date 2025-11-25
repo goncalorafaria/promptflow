@@ -6,11 +6,11 @@ import time
 from functools import partial, reduce
 from typing import Any, Callable, List, Tuple, Union
 
-from tinyflow.actor import Actor, Control
+from promptflow.actor import Actor, Control
 
 # internal imports
-from tinyflow.asynchronous import Queue, async_wrap, create_task, gather, remote_wrap
-from tinyflow.constants import (
+from promptflow.asynchronous import Queue, async_wrap, create_task, gather
+from promptflow.constants import (
     BRANCH,
     BULLET,
     CAT,
@@ -25,7 +25,60 @@ from tinyflow.constants import (
     State,
     Value,
 )
-from tinyflow.remote import HttpSession, request_broadcast, trace_config
+from promptflow.remote import HttpSession, request_broadcast, trace_config
+from promptflow.functools import format_function
+
+
+async def func_applier_many(
+    func,
+    id: str,
+    data: Any,
+    output: Actor,
+    unsubscribe: Union[Queue, None] = None,
+) -> bool:
+    """This function applies a function to a sequence of elements and adds each element to the output actor stream.
+
+    Args:
+        func (function): Function to be applied. ( Any -> List[Any] )
+        id (str): element key.
+        data (Any): element value.
+        output (Actor): Output actor stream.
+        unsubscribe (Union[Queue, None]) : Unsubscribe queue.
+    """
+
+    outputs = await func(data)
+    n = len(outputs)
+
+    for i, output_data in enumerate(outputs):
+        await output.commit(f"{id}{SEP}{i}{OF}{n}", output_data)
+
+    # This guarantees that the buffer is bounded.
+    if unsubscribe: 
+        _ = await unsubscribe.get()
+
+
+async def func_applier(
+    func,
+    id: str,
+    data: Any,
+    output: Actor,
+    unsubscribe: Union[Queue, None] = None,
+) -> bool:
+    """This function applies a function to a single element and awaits the result.
+    func (function): Function to be applied. ( Any -> Any )
+    id (str): element key.
+    data (Any): element value.
+    output (Actor): Output actor stream.
+    unsubscribe (Union[Queue, None]) : Rate Limiter Queue.
+    """
+
+    output_data = await func(data)
+
+    await output.commit(id, output_data)
+
+    # This guarantees that the buffer is bounded.
+    if unsubscribe:
+        _ = await unsubscribe.get()
 
 
 class Process:
@@ -78,10 +131,15 @@ class Process:
         """Implements this process async execution function."""
         raise NotImplementedError()
 
-
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.name})"
+    
+    def __str__(self):
+        return self.__repr__()
+    
 class ProcessUnion(Process):
     def __init__(self, process1, process2):
-        super().__init__(name="union")
+        super().__init__(name="{}-> {}".format(process1.name, process2.name))
         self.process1 = process1
         self.process2 = process2
 
@@ -241,7 +299,7 @@ class Junction(Process):
         return outnode
 
 
-class Map(Process):
+class MetaMap(Process):
     """This process applies a particular async function to each element of the input stream."""
 
     def __init__(
@@ -258,67 +316,16 @@ class Map(Process):
         """
 
         if name is None:
-            name = f"Map:{func}:"
+            name = f"map:{format_function(func)}"
 
         super().__init__(name)
         self.func = func
         if many:
-            self.func_applier = self.func_applier_many
+            self.func_applier =  func_applier_many
         else:
-            self.func_applier = self.func_applier
+            self.func_applier =  func_applier
 
         
-    async def func_applier_many(
-        func,
-        id: str,
-        data: Any,
-        output: Actor,
-        unsubscribe: Union[Queue, None] = None,
-    ) -> bool:
-        """This function applies a function to a sequence of elements and adds each element to the output actor stream.
-
-        Args:
-            func (function): Function to be applied. ( Any -> List[Any] )
-            id (str): element key.
-            data (Any): element value.
-            output (Actor): Output actor stream.
-            unsubscribe (Union[Queue, None]) : Unsubscribe queue.
-        """
-
-        outputs = await func(data)
-        n = len(outputs)
-
-        for i, output_data in enumerate(outputs):
-            await output.commit(f"{id}{SEP}{i}{OF}{n}", output_data)
-
-        # This guarantees that the buffer is bounded.
-        if unsubscribe: 
-            _ = await unsubscribe.get()
-
-
-    async def func_applier(
-        func,
-        id: str,
-        data: Any,
-        output: Actor,
-        unsubscribe: Union[Queue, None] = None,
-    ) -> bool:
-        """This function applies a function to a single element and awaits the result.
-        func (function): Function to be applied. ( Any -> Any )
-        id (str): element key.
-        data (Any): element value.
-        output (Actor): Output actor stream.
-        unsubscribe (Union[Queue, None]) : Rate Limiter Queue.
-        """
-
-        output_data = await func(data)
-
-        await output.commit(id, output_data)
-
-        # This guarantees that the buffer is bounded.
-        if unsubscribe:
-            _ = await unsubscribe.get()
-
 
     async def execute(self, input: Actor, output: Actor) -> bool:
         """Executes the mapping process.
@@ -350,7 +357,7 @@ class Map(Process):
 
                 runs.append(
                     create_task(
-                        self.func_applier(self.func, id, data, output, inflight)
+                        self.func_applier(func=self.func, id=id, data=data, output=output)
                     )
                 )
 
@@ -384,7 +391,7 @@ class Callback(ControlProcess):
         """
 
         if name is None:
-            name = f"Callback:{func}:"
+            name = f"Callback:{format_function(func)}"
 
         super().__init__(name)
         self.func = func
@@ -792,14 +799,14 @@ class UnBatching(Process):
         return True
 
 
-class NativeMap(Map):
+class NativeMap(MetaMap):
     """Applies a function in another process in this machine and async waits for the result."""
 
     def __init__(
         self,
         func: Callable[[Value], Value],
-        many: bool,
         name: Union[str, None] = None,
+        many: bool=False
     ):
         """Create a native map process.
 
@@ -808,27 +815,27 @@ class NativeMap(Map):
             many (bool): Whether to do a flat map or not.
         """
 
-        if DEBUG:
-            _func = async_wrap(func)
-        else:
-            _func = remote_wrap(func)
+        #if DEBUG:
+        _func = async_wrap(func)
+        #else:
+        #    _func = remote_wrap(func)
 
         super().__init__(func=_func, many=many, name=name)
 
 
-class ClassicMap(NativeMap):
+class Map(NativeMap):
     """Applies a function another process in this machine and async waits for the result.
 
     It's a Native map with many=False.
     """
 
-    def __init__(self, func: Callable[[Value], Value], name: Union[str, None] = None):
+    def __init__(self, func: Callable[[Value], Value]):
         """Creates a classic map process.
 
         Args:
             func (function): Function to be applied.
         """
-        super().__init__(func=func, name=name, many=False)
+        super().__init__(func=func, name="map({})".format(format_function(func)), many=False)
 
 
 class FlatMap(NativeMap):
@@ -843,7 +850,7 @@ class FlatMap(NativeMap):
         super().__init__(func=func, many=True)
 
 
-class RemoteMap(Map):
+class RemoteMap(MetaMap):
     """Applies a function in another machine and waits async for the result."""
 
     def __init__(
