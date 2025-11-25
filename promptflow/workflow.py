@@ -6,7 +6,13 @@ from typing import Any, List
 
 # internal imports
 from promptflow.actor import Actor
-from promptflow.process import ProcessUnion
+from promptflow.constants import (
+    DEFAULT_WORKFLOW_FIGURE_SIZE,
+    DEFAULT_WORKFLOW_FONT_SIZE,
+    DEFAULT_WORKFLOW_NODE_SIZE,
+    DEFAULT_WORKFLOW_PDF_FILENAME,
+)
+
 
 
 class WorkFlow:
@@ -71,24 +77,27 @@ class WorkFlow:
         import matplotlib.pyplot as plt
         import networkx as nx
 
-        plt.figure(figsize=(18, 18))
+        fig = plt.figure(figsize=DEFAULT_WORKFLOW_FIGURE_SIZE)
 
-        G = nx.DiGraph(edges)
-        pos = nx.fruchterman_reingold_layout(G)  # Seed layout for reproducibility
-        nx.draw(
-            G,
-            pos,
-            node_color="b",
-            node_size=400,
-            with_labels=True,
-            font_size=12,
-        )
+        try:
+            G = nx.DiGraph(edges)
+            pos = nx.fruchterman_reingold_layout(G)  # Seed layout for reproducibility
+            nx.draw(
+                G,
+                pos,
+                node_color="b",
+                node_size=DEFAULT_WORKFLOW_NODE_SIZE,
+                with_labels=True,
+                font_size=DEFAULT_WORKFLOW_FONT_SIZE,
+            )
 
-        if save_img:
-            plt.savefig("workflow.pdf")
-
-        else:
-            plt.show()
+            if save_img:
+                plt.savefig(DEFAULT_WORKFLOW_PDF_FILENAME)
+            else:
+                plt.show()
+        finally:
+            # Ensure figure is closed to free resources
+            plt.close(fig)
 
     async def __forward_and_run(self, *args, **kwargs) -> List[Any]:
         """Auxiliary function to define and run the pipeline.
@@ -111,8 +120,12 @@ class WorkFlow:
         return asyncio.run(self.__forward_and_run(*args, **kwargs))
 
     
-    async def run(*kwargs: List[Actor]) -> List[Any]:
+    @staticmethod
+    async def run(*args: Actor) -> List[Any]:
         """Function to run the pipeline.
+
+        Args:
+            *args: Variable number of Actor instances to run.
 
         Returns:
             List[Any]: One result for each output actor of the pipeline.
@@ -125,7 +138,7 @@ class WorkFlow:
         initial_frontier = []
         visited = set()
 
-        for output in kwargs:
+        for output in args:
             if isinstance(output, list):
                 initial_frontier.extend(output)
 
@@ -180,17 +193,3 @@ class WorkFlow:
         results = await asyncio.gather(*tasks)
 
         return results[-noutputs:]
-
-
-### I would like to build a function that given some unionprocess turns it into a workflow. 
-
-def convert_to_workflow(process: ProcessUnion) -> WorkFlow:
-    """
-    Given a ProcessUnion, turns it into a Workflow.
-    """
-    
-    class InplaceWorkflow(WorkFlow):
-        def forward(self, *args, **kwargs):
-            return process(*args, **kwargs)
-    
-    return InplaceWorkflow()

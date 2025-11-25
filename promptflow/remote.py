@@ -7,6 +7,13 @@ from typing import Any, Callable, Dict, List, Tuple
 import aiohttp
 from aiohttp import ClientSession
 
+from promptflow.constants import (
+    DEFAULT_BACKOFF_BASE,
+    DEFAULT_MAXIMUM_BACKOFF,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MINIMUM_RETRIES,
+)
+
 HttpSession = ClientSession
 
 
@@ -22,9 +29,9 @@ async def post(
     url: str,
     data: bytes,
     session: HttpSession,
-    maximum_backoff: int = 10,
-    max_retries: int = 400,
-    minimum_retries: int = 300,
+    maximum_backoff: int = DEFAULT_MAXIMUM_BACKOFF,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    minimum_retries: int = DEFAULT_MINIMUM_RETRIES,
     **kwargs,
 ) -> Any:
     """Sends a POST request to `url` with `data` and awaits result.
@@ -58,17 +65,16 @@ async def post(
     iteration = 0
     while True:
         try:
-            resp = await session.post(url=url, data=data, **kwargs)
-            # do something with the response if needed
-            resp.raise_for_status()
+            async with session.post(url=url, data=data, **kwargs) as resp:
+                # do something with the response if needed
+                resp.raise_for_status()
 
-            logging.debug(f"Got response {resp.status} for URL: {url}")
-            # logger.info("Got response [%s] for URL: %s", resp.status, url)
-            outputs = await resp.json()
+                logging.debug(f"Got response {resp.status} for URL: {url}")
+                # logger.info("Got response [%s] for URL: %s", resp.status, url)
+                outputs = await resp.json()
             iteration = 0
             break
-            # here, the async with context for the response ends, and the response is
-            # released.
+            # Response is automatically closed when exiting the async with block
         except aiohttp.ClientConnectionError as e:
             logging.info(e)
             # something went wrong with the exception, decide on what to do next
@@ -99,7 +105,7 @@ async def post(
             # random_number_milliseconds is a random number of milliseconds less than or equal to 1000. This helps to avoid cases in which many clients are synchronized by some situation and all retry at once, sending requests in synchronized waves. The value of random_number_milliseconds is recalculated after each retry request.
             random_number_milliseconds = random.random()
             wait_time = min(
-                ((1.5**iteration) + random_number_milliseconds), maximum_backoff
+                ((DEFAULT_BACKOFF_BASE**iteration) + random_number_milliseconds), maximum_backoff
             )
             await asyncio.sleep(wait_time)
 

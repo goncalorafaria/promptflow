@@ -1,7 +1,7 @@
 from promptflow import *
 from promptflow.functools import *
 
-example_list=["hello ghwi ogwhowhgw o0ghjwohgwog  gohw9ohgowhg ohgiouwejgj oghjwoue90 hello"]
+example_list=["hello ghwi ogwhowhgw o0ghjwohgwog gohw9ohgowhg ohgiouwejgj oghjwoue90 hello"]
 
 class WordCount(WorkFlow):
 
@@ -22,18 +22,23 @@ class WordCount(WorkFlow):
         return b(a)
  
  
-b = (  FlatMap(
+word_count_pipeline = (  
+    FlatMap(
         func=lambda line: line.split()) 
-| Map(
-    func=lambda word: (word, 1),
-) 
-| Aggregate(key_factory = fst, ) 
-| Map(func=lambda words: ( sum(map(snd, words)) ))
+    | Map(
+        func=lambda word: (word, 1),
+    ) 
+    | Aggregate(
+        key_factory = fst, ) 
+    | Map(
+        func=lambda words: ( sum(map(snd, words)) ))
 )
 
-resultsb = Iterable(iterable=example_list, keyvalue=False) 
-wf1 = convert_to_workflow(b)
+final_process = word_count_pipeline(example_list)
 
+print(final_process)
+
+print(final_process.run())
 import pdb; pdb.set_trace()    
     
 wf = WordCount()

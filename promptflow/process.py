@@ -6,8 +6,7 @@ import time
 from functools import partial, reduce
 from typing import Any, Callable, List, Tuple, Union
 
-from promptflow.actor import Actor, Control
-
+from promptflow.actor import Actor, Control, try_to_convert_to_input
 # internal imports
 from promptflow.asynchronous import Queue, async_wrap, create_task, gather
 from promptflow.constants import (
@@ -17,6 +16,9 @@ from promptflow.constants import (
     CTRL,
     DEBUG,
     DEFAULT_BATCH,
+    DEFAULT_CRONO_ALPHA,
+    DEFAULT_CRONO_INITIAL_RATE,
+    DEFAULT_CRONO_RATE_MULTIPLIER,
     DEFAULT_INFLIGHT_BATCH,
     MAX_BUFFER_SIZE,
     OF,
@@ -27,7 +29,7 @@ from promptflow.constants import (
 )
 from promptflow.remote import HttpSession, request_broadcast, trace_config
 from promptflow.functools import format_function
-
+from promptflow.workflow import WorkFlow
 
 async def func_applier_many(
     func,
@@ -96,7 +98,7 @@ class Process:
         """
         self.name = name
 
-    def __call__(self, node: Actor) -> Actor:
+    def __call__(self, node: Union[Actor,Any]) -> Actor:
         """Applies the process to a input actor stream.
 
         Args:
@@ -105,7 +107,8 @@ class Process:
         Returns:
             outputnode (Actor): Output actor stream.
         """
-
+        node = try_to_convert_to_input(node)
+        
         outnode = Bridge(
             # f"{node}{SEP}{self.name}{SEP}",
             self.name,
@@ -144,6 +147,7 @@ class ProcessUnion(Process):
         self.process2 = process2
 
     def __call__(self, *node: List[Actor]):
+        node = [try_to_convert_to_input(n) for n in node]
         return self.process2(self.process1(*node))
 
 
@@ -168,7 +172,13 @@ class Bridge(Actor):
             Tuple[Process,List[Actor]]: _description_
         """
         return self.op, self.parents
-
+    
+    def __call__(self):
+        return self.run()
+    
+    
+    def run(self):
+        return convert_from_bridge(self)()
 
 class ControlBridge(Control):
     """Actor stream that is the result of applying a process."""
@@ -191,6 +201,12 @@ class ControlBridge(Control):
             Tuple[Process,List[Actor]]: _description_
         """
         return self.op, self.parents
+
+    def run(self):
+        return convert_from_bridge(self)()
+    
+    def __call__(self):
+        return self.run()
 
 
 class ControlProcess(Process):
@@ -216,6 +232,8 @@ class ControlProcess(Process):
         Returns:
             outputnode (Actor): Output actor stream.
         """
+        
+        node = try_to_convert_to_input(node)
 
         outnode = ControlBridge(
             # f"{node}{SEP}{self.name}{SEP}",
@@ -273,7 +291,7 @@ class Junction(Process):
 
         super().__init__(name)
 
-    def __call__(self, *nodes: List[Actor]) -> Actor:
+    def __call__(self, *nodes: Union[Actor,Any]) -> Actor:
         """_summary_
 
         Args:
@@ -283,6 +301,8 @@ class Junction(Process):
             _type_: _description_
         """
 
+        nodes = [try_to_convert_to_input(n) for n in nodes]
+        
         outnode = Bridge(
             # f"{nodes}{SEP}{self.name}{SEP}",
             self.name,
@@ -437,18 +457,18 @@ class Crono(Callback):
 
     def __init__(self, name: Union[None, str] = None):
         """Creates a crono process."""
-        self.curr_rate = 10
-        self.alpha = 0.5
+        self.curr_rate = DEFAULT_CRONO_INITIAL_RATE
+        self.alpha = DEFAULT_CRONO_ALPHA
         self.last_time = time.time()
 
         def append_time(id, data, state):
 
-            now = time()
+            now = time.time()
 
             elapsed = now - self.last_time
 
-            if elapsed > self.curr_rate * 10:
-                self.curr_rate = 10
+            if elapsed > self.curr_rate * DEFAULT_CRONO_RATE_MULTIPLIER:
+                self.curr_rate = DEFAULT_CRONO_INITIAL_RATE
 
             self.curr_rate = self.alpha * (self.curr_rate - elapsed) + elapsed
             print(f"crono:{name} >: {1/self.curr_rate}")
@@ -695,14 +715,14 @@ class Batching(Process):
 
     def __init__(
         self,
-        size: int = 8,
+        size: int = DEFAULT_BATCH,
         name: str = "batching",
         select: Callable[[Value], bool] = lambda data: not (data is None),
     ):
         """Creates a batching proess.
 
         Args:
-            size (int): Batch size. Defaults to 8.
+            size (int): Batch size. Defaults to DEFAULT_BATCH.
             select (function): Predicate determining which values to form a batch.
         """
 
@@ -977,3 +997,26 @@ class Aggregate(Junction):
 
         return len(cache) > 0
 
+
+### I would like to build a function that given some unionprocess turns it into a workflow. 
+
+def convert_to_workflow(process: ProcessUnion) -> WorkFlow:
+    """
+    Given a ProcessUnion, turns it into a Workflow.
+    """
+    
+    class InplaceWorkflow(WorkFlow):
+        def forward(self, *args, **kwargs):
+            return process(*args, **kwargs)
+    
+    return InplaceWorkflow()
+
+def convert_from_bridge(bridge: Bridge) -> WorkFlow:
+    """
+    Given a Bridge, turns it into a Workflow.
+    """
+    class InplaceWorkflow(WorkFlow):
+            def forward(self):
+                return bridge
+        
+    return InplaceWorkflow()

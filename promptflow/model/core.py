@@ -1,0 +1,451 @@
+from transformers import AutoTokenizer
+import requests
+import aiohttp
+import asyncio
+import time
+import os
+import logging
+from typing import Any, Union
+from qalign.utils.list import unflatten_list
+
+# Import promptflow dependencies
+from promptflow.process import MetaMap
+from promptflow.actor import Actor
+from promptflow.asynchronous import Queue, create_task, gather
+from promptflow.constants import BULLET, DEFAULT_INFLIGHT_BATCH, SEP, OF
+
+## get env variable DEBUG
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+
+class RemoteVLLM:
+    def __init__(
+        self,
+        server_url: str,
+        model_path: str,
+        max_new_tokens: int = 1024,
+        max_prompt_length: int = 1024*3,
+        stop_tokens: list = None,
+        temperature: float = 1.0,
+        timeout: float = 300,
+        max_retries: int = 15,
+        max_concurrent_requests: int = 256,
+    ):
+        
+        self.server_url = server_url.rstrip("/")
+       
+    
+        self.temperature = temperature
+        self.max_new_tokens = max_new_tokens
+        self.max_prompt_length = max_prompt_length - 1
+         
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.max_concurrent_requests = max_concurrent_requests
+
+
+        self.model_path = model_path 
+        self._check_health()
+        
+
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path,
+            padding_side="left",
+        )
+        
+        if stop_tokens is None:
+            self.stop_tokens = [self.tokenizer.eos_token]
+        else:
+            self.stop_tokens = stop_tokens + [self.tokenizer.eos_token]
+        
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
+            self.tokenizer.pad_token = self.tokenizer.bos_token
+        
+
+
+    def encode(self, prompt_txt):
+        tokens = self.tokenize(prompt_txt)
+        return tokens
+
+    def tokenize(self, prompt, **tokenizer_kwargs):
+        return [
+            self.tokenizer.encode(
+                p,
+                max_length=self.max_prompt_length+self.max_new_tokens,
+                truncation=True,
+                add_special_tokens=False,
+                **tokenizer_kwargs
+            )
+            for p in prompt
+        ]
+    
+    def decode_tokenize(self, ids): 
+        return self.tokenizer.batch_decode(ids, skip_special_tokens=False, spaces_between_special_tokens=False)
+
+    def _truncate_tokens(self, tokenized_input):
+        """
+        Truncate tokenized input if it exceeds max_prompt_length.
+        Keeps the end of the sequence (most recent tokens).
+        
+        Args:
+            tokenized_input: List of token IDs
+            
+        Returns:
+            Truncated list of token IDs
+        """
+        if len(tokenized_input) <= self.max_prompt_length:
+            return tokenized_input
+        
+        # Truncate from the beginning, keeping the end
+        return tokenized_input[-self.max_prompt_length:]
+
+    def _check_health(self):
+        url = f"{self.server_url}/v1/models"
+        try:
+            resp = requests.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            
+            ## check if self.model_path is in the response
+            if not len([1 for x in resp.json()["data"] if x["id"] == self.model_path ]):
+                raise ConnectionError(f"Model {self.model_path} not found in the response: - {resp.json()} - {url}")
+            
+            if DEBUG:
+                print(f"Server[{self.model_path}]: {self.server_url} is healthy and ready for requests.")
+            return True
+        except Exception as e:
+            raise ConnectionError(f"Server health check failed: {str(e)}")
+
+    def _post_with_retries(self, endpoint, payload, use_tqdm=False):
+        """Synchronous wrapper for async POST requests with retries."""
+        return asyncio.run(self._post_with_retries_async(endpoint, payload, use_tqdm=use_tqdm))
+    
+    async def _post_with_retries_async(self, endpoint, payload, use_tqdm=False):
+        """
+        Submit requests with retry logic and connection pooling.
+        
+        Args:
+            endpoint: API endpoint to call
+            payload: List of payloads to send
+            use_tqdm: Whether to show progress bar
+            
+        Returns:
+            List of responses
+            
+        Raises:
+            RuntimeError: If all retry attempts fail
+        """
+        # Create ONE session with connection pooling for ALL requests
+        # Since server is a single host, set limits based on max_concurrent_requests
+        # Connection reuse means actual connections needed < max_concurrent_requests
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrent_requests,  # Total connection pool size
+            limit_per_host=self.max_concurrent_requests,  # Max connections to server
+            ttl_dns_cache=600,
+            enable_cleanup_closed=True
+        )
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async def _make_request_with_retries(p):
+                for attempt in range(self.max_retries):
+                    try:
+                        async with session.post(
+                            f"{self.server_url}{endpoint}",
+                            json=p,
+                            timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        ) as resp:
+                            resp.raise_for_status()
+                            data = await resp.json()
+                            if isinstance(data, dict):
+                                data = [data]
+                            return data
+                    except Exception as e:
+                        if attempt == self.max_retries - 1:
+                            raise RuntimeError(f"Request failed after {self.max_retries} attempts: {e}")
+                        await asyncio.sleep(1)
+            
+            # Limit concurrent requests using a semaphore
+            semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+            
+            async def limited_request(p):
+                async with semaphore:
+                    return await _make_request_with_retries(p)
+            
+            tasks = [limited_request(p) for p in payload]
+            
+            if use_tqdm:
+                from tqdm import tqdm
+                
+                # Create a wrapper to update progress bar
+                completed_count = [0]
+                pbar = tqdm(total=len(tasks), desc="Processing")
+                
+                async def tracked_task(task):
+                    result = await task
+                    completed_count[0] += 1
+                    pbar.update(1)
+                    return result
+                
+                results = await asyncio.gather(*[tracked_task(task) for task in tasks])
+                pbar.close()
+            else:
+                results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        flattened_results = []
+        for result in results:
+            flattened_results.extend(result)
+        
+        return flattened_results
+
+    async def _post_with_retries_async_original(self, endpoint, payload):
+        """Original approach: separate session for each request"""
+        async def _make_request_with_retries(p):
+            for attempt in range(self.max_retries):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{self.server_url}{endpoint}",
+                            json=p,
+                            timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        ) as resp:
+                            resp.raise_for_status()
+                            data = await resp.json()
+                            if isinstance(data, dict):
+                                data = [data]
+                            return data
+                except Exception as e:
+                    if attempt == self.max_retries - 1:
+                        raise RuntimeError(f"Request failed after {self.max_retries} attempts: {e}")
+                    await asyncio.sleep(1)
+        
+        # Create tasks for all requests and run them concurrently
+        tasks = [_make_request_with_retries(p) for p in payload]
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        flattened_results = []
+        for result in results:
+            flattened_results.extend(result)
+        
+        return flattened_results
+
+    def _get(self, endpoint):
+        request = requests.get(f"{self.server_url}{endpoint}", timeout=self.timeout)
+        request.raise_for_status()
+        return request.json()
+    
+    
+    def continuation(self, prompt, prefix=None, use_tqdm=False):
+        if prefix is None:
+            input_data = prompt
+        else:
+            input_data = [x[0] + x[1] for x in zip(prompt, prefix)]
+        
+        # Truncate all inputs to max_prompt_length
+        input_data = [self._truncate_tokens(x) for x in input_data]
+
+        #prompt_text = self.decode_tokenize(
+        #    input_data, skip_special_tokens=True, spaces_between_special_tokens=False
+        #)
+        lengths = [len(x) for x in input_data]
+        #print("lengths-prefix:",lengths)
+         ## skip special tokens at False was causing major issues.
+        prompt_text = self.decode_tokenize(input_data)
+        
+       
+
+        payload = [
+            {
+                "model": self.model_path,
+                "prompt": p,
+                "temperature": self.temperature,
+                "logprobs": 1,
+                "max_tokens": self.max_new_tokens,
+                "stop": self.stop_tokens,
+            }
+            for p in prompt_text
+        ]
+
+        if DEBUG:
+            print("model_packet:",payload[0])
+
+        results = self._post_with_retries("/v1/completions", payload, use_tqdm=use_tqdm)
+
+        completions = [
+            choice["text"] 
+            for result in results
+            for choice in result.get("choices", [])
+        ]
+
+        completion_ids = [xi for xi in self.tokenize(completions)]
+        #print("lengths-completion:",[len(xi) for xi in completion_ids])
+        
+        return completion_ids 
+
+    def ancestral(
+        self,
+        input_data,
+        n: int = 1,
+        use_tqdm=False,
+    ):
+        # Truncate input_data (text) by tokenizing, truncating, then decoding
+        tokenized_data = []
+        for prompt in input_data:
+            tokens = self.tokenizer.encode(prompt, max_length=self.max_prompt_length, truncation=True)
+            truncated_prompt = self.tokenizer.decode(tokens, skip_special_tokens=False)
+            tokenized_data.append(truncated_prompt)
+        
+        prompts = []
+        for prompt in tokenized_data: 
+            prompts.extend([prompt] * n)
+
+        payload = [
+            {
+                "model": self.model_path,
+                "prompt": p,
+                "max_tokens": self.max_new_tokens,
+                "temperature": self.temperature, 
+                "n": 1,
+                "stop": self.stop_tokens,
+            }
+            for p in prompts
+        ]
+
+        results = self._post_with_retries("/v1/completions", payload, use_tqdm=use_tqdm)
+
+        completions = [
+            choice["text"] for result in results for choice in result.get("choices", [])
+        ]
+        return unflatten_list(completions, [n] * len(input_data))
+
+    def __str__(self):
+        return f"RemoteVLLM(model_path={self.model_path}, server_url={self.server_url})"
+
+
+class VLLMMap(MetaMap):
+    """Applies a vLLM model's ancestral method to each element of the input stream asynchronously."""
+
+    def __init__(
+        self,
+        vllm_client: RemoteVLLM,
+        n: int = 1,
+        name: Union[str, None] = None,
+        many: bool = False,
+        inflight_batch: int = DEFAULT_INFLIGHT_BATCH,
+    ):
+        """Creates a vLLM map process using the ancestral method.
+
+        Args:
+            vllm_client (RemoteVLLM): RemoteVLLM client instance.
+            n (int): Number of completions to generate per input. Defaults to 1.
+            name (Union[str, None]): Process name. Defaults to None.
+            many (bool): If true, expects method to return a list and flattens results. Defaults to False.
+            inflight_batch (int): Maximum number of concurrent requests. Defaults to DEFAULT_INFLIGHT_BATCH.
+        """
+        # Store instance variables first
+        self.vllm_client = vllm_client
+        self.n = n
+        self.inflight_batch = inflight_batch
+
+        if name is None:
+            name = f"VLLMMap:{vllm_client.model_path}:ancestral"
+
+        # Create async wrapper function using closure to capture instance variables
+        vllm_client_ref = vllm_client
+        n_ref = n
+
+        async def vllm_func(data: Any) -> Any:
+            """Async wrapper that calls the ancestral method on RemoteVLLM."""
+            return await self._vllm_process_impl(data, vllm_client_ref, n_ref)
+
+        # Initialize parent with the async function
+        super().__init__(func=vllm_func, many=many, name=name)
+
+    async def _vllm_process_impl(
+        self, data: str, vllm_client: RemoteVLLM,
+    ) -> Any:
+        """Async implementation that calls the ancestral method on RemoteVLLM."""
+        # Prepare input: data can be a string or list of strings
+        prompt = [data]
+        
+        # Call ancestral method - expects text input
+        result = await vllm_client._post_with_retries_async(
+            "/v1/completions",
+            self._build_ancestral_payload(vllm_client, prompt, n=1),
+            use_tqdm=False,
+        )
+        
+        completions = [
+            choice["text"]
+            for r in result
+            for choice in r.get("choices", [])
+        ]
+        return completions
+
+    def _build_ancestral_payload(self, vllm_client: RemoteVLLM, prompts, n: int = 1):
+        """Build payload for ancestral method."""
+        # Expand prompts by n
+        expanded_prompts = []
+        for prompt in prompts:
+            expanded_prompts.extend([prompt] * n)
+
+        return [
+            {
+                "model": vllm_client.model_path,
+                "prompt": p,
+                "max_tokens": vllm_client.max_new_tokens,
+                "temperature": vllm_client.temperature,
+                "n": 1,
+                "stop": vllm_client.stop_tokens,
+            }
+            for p in expanded_prompts
+        ]
+
+    async def execute(self, input: Actor, output: Actor) -> bool:
+        """Executes the vLLM mapping process.
+
+        Args:
+            input (Actor): Input actor stream to consume.
+            output (Actor): Output actor stream to produce.
+
+        Returns:
+            bool: True if successful.
+        """
+
+        inflight = Queue(maxsize=self.inflight_batch)
+
+        logging.debug(f"Launching task: {self.name}")
+        st = time.time()
+
+        runs = []
+
+        async for id, data in input.iterable(output):
+
+            logging.debug(f"Task {self.name}: instance {id}; ")
+
+            if BULLET in id:
+                # Skip processing for bullet items
+                await output.commit(id, data)
+            else:
+                await inflight.put(1)
+
+                runs.append(
+                    create_task(
+                        self.func_applier(
+                            func=self.func,
+                            id=id,
+                            data=data,
+                            output=output,
+                            unsubscribe=inflight,
+                        )
+                    )
+                )
+
+        await gather(*runs)
+        await output.stop()
+
+        logging.debug(f"Finished launching task: {self.name}. Syncing runs.")
+        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
+
+        return True

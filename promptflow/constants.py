@@ -1,3 +1,7 @@
+import os
+from typing import Any
+
+# String separators for key encoding
 STOP = None
 SEP = ":"
 CAT = "$"
@@ -38,16 +42,34 @@ Ideally should be twice the number of machines serving in each stage for prefetc
 In a operacionalzied scenario, it might be best to leave this unbounded. 
 Let the autoscalar and loadbalancer deal with it. 
 """
-# datatypes
-from typing import Any
 
-State = Any
-Value = Any
-Key = str
-
-DEBUG = True
+# Debug configuration
+DEBUG = os.getenv("PROMPTFLOW_DEBUG", "True").lower() == "true"
 """
-    This is significantly less efficient. But makes it easier to debug. 
+    This is significantly less efficient. But makes it easier to debug.
+    Can be configured via PROMPTFLOW_DEBUG environment variable.
 """
 
 WORKER_LOG_SPLIT = "*" * 40
+
+# Remote HTTP request configuration
+DEFAULT_MAXIMUM_BACKOFF = 10  # Maximum backoff time in seconds
+DEFAULT_MAX_RETRIES = 400  # Maximum number of retry attempts
+DEFAULT_MINIMUM_RETRIES = 300  # Minimum retries before applying backoff
+DEFAULT_BACKOFF_BASE = 1.5  # Exponential backoff base multiplier
+
+# Crono process configuration
+DEFAULT_CRONO_INITIAL_RATE = 10.0  # Initial rate for crono process
+DEFAULT_CRONO_ALPHA = 0.5  # Smoothing factor for rate calculation
+DEFAULT_CRONO_RATE_MULTIPLIER = 10  # Multiplier for rate reset threshold
+
+# Workflow visualization configuration
+DEFAULT_WORKFLOW_FIGURE_SIZE = (18, 18)  # Figure size in inches (width, height)
+DEFAULT_WORKFLOW_NODE_SIZE = 400  # Node size for networkx visualization
+DEFAULT_WORKFLOW_FONT_SIZE = 12  # Font size for node labels
+DEFAULT_WORKFLOW_PDF_FILENAME = "workflow.pdf"  # Default filename for saved workflow diagram
+
+# datatypes
+State = Any
+Value = Any
+Key = str
