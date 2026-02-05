@@ -21,6 +21,8 @@ class LLMResponse:
     output: str
     reasoning: str
     text: str
+    valid: bool=True
+    
     
     def __init__(self, response: str):
         self.reasoning, self.output = parse_thinking_tokens_qwen(response)
@@ -32,6 +34,11 @@ class LLMResponse:
     def __repr__(self):
         return f"LLMResponse(reasoning={self.reasoning}, output={self.output})"
     
+    def make_invalid(self):
+        self.valid = False
+        return self
+        
+    
 
 class Assertion:
     def check(self, response: LLMResponse) -> bool:
@@ -41,6 +48,12 @@ class HasJson(Assertion):
 
     def check(self, response: LLMResponse) -> bool:
         return extract_json_from_response(response.output) is not None
+    
+    def __str__(self):
+        return "Assert:HasJson()"
+    
+    def __repr__(self):
+        return "Assert:HasJson()"
 
 class HasJsonKey(Assertion):
     def __init__(self, key: str):
@@ -52,6 +65,11 @@ class HasJsonKey(Assertion):
         else:
             return self.key in json_response
 
+    def __str__(self):
+        return f"Assert:HasJsonKey({self.key})"
+    
+    def __repr__(self):
+        return f"Assert:HasJsonKey({self.key})"
 
 
 class RemoteLLMClient:
@@ -276,6 +294,103 @@ class RemoteLLMClient:
         return f"RemoteVLLM(model_path={self.model_path}, server_url={self.server_url})"
 
 
+class ChatGPTClient:
+    """Client for OpenAI's ChatGPT API using the official Python library."""
+    
+    def __init__(
+        self,
+        api_key: str = None,
+        model: str = "gpt-4o",
+        max_new_tokens: int = 1024,
+        stop_tokens: list = None,
+        timeout: float = 300,
+        max_retries: int = 15,
+        max_concurrent_requests: int = 64,
+        base_url: str = None,
+    ):
+        """Initialize ChatGPT client.
+        
+        Args:
+            api_key: OpenAI API key. If None, reads from OPENAI_API_KEY env variable.
+            model: Model name (e.g., "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo").
+            max_new_tokens: Maximum tokens in the response.
+            stop_tokens: Optional list of stop sequences.
+            timeout: Request timeout in seconds.
+            max_retries: Maximum number of retry attempts.
+            max_concurrent_requests: Maximum concurrent API requests.
+            base_url: Base URL for OpenAI API (useful for Azure or proxies).
+        """
+        from openai import AsyncOpenAI
+        
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("API key must be provided or set via OPENAI_API_KEY environment variable")
+        
+        self.model = model
+        self.model_path = model  # Alias for compatibility with RemoteLLMClient
+        self.max_new_tokens = max_new_tokens
+        self.stop_tokens = stop_tokens
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.max_concurrent_requests = max_concurrent_requests
+        
+        # Initialize the async OpenAI client
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        
+        if DEBUG:
+            print(f"ChatGPTClient initialized with model: {self.model}")
+    
+    async def _make_request_with_semaphore(self, semaphore, messages, n=1):
+        """Make a single API request with semaphore for concurrency control."""
+        async with semaphore:
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_completion_tokens": self.max_new_tokens,
+                    #"temperature": self.temperature,
+                    "n": n,
+                }
+                
+                if self.stop_tokens:
+                    kwargs["stop"] = self.stop_tokens
+                
+                response = await self.client.chat.completions.create(**kwargs)
+                return response
+            except Exception as e:
+                raise RuntimeError(f"ChatGPT API request failed: {e}")
+    
+    async def invoke(self, chat_template_prompt, n=1) -> list:
+        """
+        Invoke the ChatGPT API with a chat template prompt.
+        
+        Args:
+            chat_template_prompt: List of message dicts, e.g., 
+                [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}]
+            n: Number of completions to generate per request.
+            
+        Returns:
+            List of LLMResponse objects.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        response = await self._make_request_with_semaphore(semaphore, chat_template_prompt, n=n)
+ 
+        completions = [
+            LLMResponse(response=choice.message.content)
+            for choice in response.choices
+        ]
+
+        return completions
+    
+    def __str__(self):
+        return f"ChatGPTClient(model={self.model})"
+
+
 class LLMMap(MetaMap):
     """Applies a vLLM model's ancestral method to each element of the input stream asynchronously."""
 
@@ -288,6 +403,7 @@ class LLMMap(MetaMap):
         output_key: str = "llm_call_output",
         inflight_batch: int = DEFAULT_INFLIGHT_BATCH,
         assertions: List[Assertion] = None,
+        max_correctness_attempts: int = 3,
     ):
         """Creates a vLLM map process using the ancestral method.
 
@@ -305,6 +421,7 @@ class LLMMap(MetaMap):
         self.input_key = input_key
         self.output_key = output_key
         self.assertions = assertions
+        self.max_correctness_attempts = max_correctness_attempts
         if name is None:
             name = f"VLLMMap:{vllm_client.model_path}:ancestral"
 
@@ -312,7 +429,8 @@ class LLMMap(MetaMap):
         super().__init__(func=self._vllm_process_impl, name=name, many=False)
 
     async def _vllm_process_impl(
-        self, data: Any
+        self, data: Any,
+        attempt: int = 0,
     ) -> Any:
         """Async implementation that calls the ancestral method on RemoteVLLM.
         
@@ -322,16 +440,34 @@ class LLMMap(MetaMap):
         """
  
         completions =await self.vllm_client.invoke(
-            data[self.input_key], n=self.n)
+            data[self.input_key], n= self.n)
 
+        
         if self.assertions is not None:
             for assertion in self.assertions:
                 
                 all_checks =[ assertion.check(completion) for completion in completions ]
                 
+                new_completions = [ ]
+                
+                for completion in completions:
+                    if assertion.check(completion):
+                        new_completions.append(completion)
+                    else:
+                        new_completions.append(completion.make_invalid())
+                        
+                completions=new_completions
+                
                 if not all(all_checks):
-                    # have to implement some level of retry here. 
-                    raise ValueError(f"Assertion {assertion} failed for completions: {completions}")
+                    
+                    if attempt < self.max_correctness_attempts:
+                        logging.warning(f"Assertion {assertion} failed for :  retrying {attempt + 1} of {self.max_correctness_attempts}")
+                        return await self._vllm_process_impl(data, attempt + 1)
+                    else:
+                        logging.error(f"Assertion {assertion} failed for completions: {completions}")
+                        return { **data, self.output_key: completions }
+                        #raise ValueError(f"Assertion {assertion} failed for completions: {completions}")
+                    
                 
         if self.output_key in data:
             logging.warning(f"output key {self.output_key} already in input data, will be overwritten")

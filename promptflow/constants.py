@@ -48,7 +48,7 @@ Let the autoscalar and loadbalancer deal with it.
 DEBUG = os.getenv("DEBUG", "False").lower() == "true" or int(os.getenv("DEBUG", "0"))==1
 
 
-logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.WARNING)
 
 WORKER_LOG_SPLIT = "*" * 40
 
