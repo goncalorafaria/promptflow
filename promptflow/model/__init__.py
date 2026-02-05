@@ -1,3 +1,2 @@
-from promptflow.model.core import RemoteVLLM, VLLMMap
+from promptflow.model.core import *
 
-__all__ = ["RemoteVLLM", "VLLMMap"]

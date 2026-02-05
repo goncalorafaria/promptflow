@@ -110,6 +110,9 @@ class Actor:
 
         if self._control:
             key = CTRL + key
+            
+            
+        logging.debug(f"[{self.name}] - Committing {key}:{value}")
 
         if len(self.children) > 0:
             for queue, qid in self.children.values():

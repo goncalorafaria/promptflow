@@ -29,7 +29,7 @@ from promptflow.constants import (
 )
 from promptflow.remote import HttpSession, request_broadcast, trace_config
 from promptflow.functools import format_function
-from promptflow.workflow import WorkFlow
+
 
 async def func_applier_many(
     func,
@@ -178,105 +178,8 @@ class Bridge(Actor):
     
     
     def run(self):
-        return convert_from_bridge(self)()
-
-class ControlBridge(Control):
-    """Actor stream that is the result of applying a process."""
-
-    def __init__(self, name: str, process: Process):
-        """creates a bridge actor stream.
-
-        Args:
-            name (str): Identifier for this actor stream.
-            process (Process): Process that transforms the input actor stream and produces data into this actor stream.
-        """
-        super().__init__(name, source=False)
-
-        self.op = process
-
-    def execution_context(self) -> Tuple[Process, List[Actor]]:
-        """Returns the execution context of this actor stream. The execution context is a tuple containing the process and the list of input actor streams.
-
-        Returns:
-            Tuple[Process,List[Actor]]: _description_
-        """
-        return self.op, self.parents
-
-    def run(self):
-        return convert_from_bridge(self)()
-    
-    def __call__(self):
-        return self.run()
-
-
-class ControlProcess(Process):
-    """Control process.
-
-    This process is used to control the workflow and gather metadata.
-    """
-
-    def __init__(self, name: str):
-        """Creates a control process.
-
-        Args:
-            name (str): Identifier for this process.
-        """
-        super().__init__(name)
-
-    def __call__(self, node: Actor) -> Actor:
-        """Applies the process to a input actor stream.
-
-        Args:
-            node (Actor): Input actor stream.
-
-        Returns:
-            outputnode (Actor): Output actor stream.
-        """
-        
-        node = try_to_convert_to_input(node)
-
-        outnode = ControlBridge(
-            # f"{node}{SEP}{self.name}{SEP}",
-            self.name,
-            process=self,
-        )
-
-        outnode.add_parent(node)
-
-        node.add_child(outnode)
-        node.add_child(outnode.control, limitless=True)
-
-        return outnode, outnode.control
-
-    async def execute(self, input: Actor, output: ControlBridge) -> bool:
-        """Executes the mapping process.
-
-        Args:
-            input (Actor): Input actor stream to consume.
-            output (Actor): Output actor stream to produce.
-
-        Returns:
-            bool : True if sucefull.
-        """
-
-        return await self.control_execute(
-            input=input, output=output, control=output.control
-        )
-
-    async def control_execute(
-        self, input: Actor, output: Actor, control: Actor
-    ) -> bool:
-        """Executes the controlled execute function.
-
-        Args:
-            input (Actor): Input actor stream to consume.
-            output (Actor): Output actor stream to produce.
-            control (Actor): Control actor stream to produce.
-
-        Returns:
-            bool : True if sucefull.
-        """
-        raise NotImplementedError()
+        raise NotImplementedError("No bridge workflows for now.")
+        #return convert_from_bridge(self)()
 
 
 class Junction(Process):
@@ -340,7 +243,7 @@ class MetaMap(Process):
 
         super().__init__(name)
         self.func = func
-        if many:
+        if many: # for flatMaps
             self.func_applier =  func_applier_many
         else:
             self.func_applier =  func_applier
@@ -377,7 +280,7 @@ class MetaMap(Process):
 
                 runs.append(
                     create_task(
-                        self.func_applier(func=self.func, id=id, data=data, output=output)
+                        self.func_applier(func=self.func, id=id, data=data, output=output, unsubscribe=inflight)
                     )
                 )
 
@@ -394,95 +297,6 @@ class MetaMap(Process):
         return True
 
 
-class Callback(ControlProcess):
-    """This process applies a particular function to each element of the input stream that collects metrics."""
-
-    def __init__(
-        self,
-        func: Callable[[Key, Value, State], State],
-        initstate: State,
-        name: Union[None, str] = None,
-    ):
-        """Creates a calback process.
-
-        Args:
-            func (function): async function to apply.
-            initstate (Any) : inicial state.
-        """
-
-        if name is None:
-            name = f"Callback:{format_function(func)}"
-
-        super().__init__(name)
-        self.func = func
-        self.initstate = initstate
-        # self.states = {}
-
-    async def control_execute(
-        self, input: Actor, output: Actor, control: Actor
-    ) -> bool:
-        """Executes the callback process.
-
-        Args:
-            input (Actor): Input actor stream to consume.
-            output (Actor): Output actor stream to produce.
-
-        Returns:
-            bool : True if sucefull.
-        """
-
-        logging.debug(f"Launching task: {self.name}")
-        st = time.time()
-
-        state = self.initstate
-        async for id, data in input.iterable(output):
-
-            logging.debug(f"Task {self.name}: instance {id};")
-
-            state = self.func(id, data, state)
-            await output.commit(id, data)
-
-        await control.commit(self.name, state)
-        await output.stop()
-        await control.stop()
-
-        logging.debug(f"Finished launching task: {self.name}. Syncing runs.")
-        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
-
-        return True
-
-
-class Crono(Callback):
-    """This process applies a particular function to each element of the input stream that collects metrics."""
-
-    def __init__(self, name: Union[None, str] = None):
-        """Creates a crono process."""
-        self.curr_rate = DEFAULT_CRONO_INITIAL_RATE
-        self.alpha = DEFAULT_CRONO_ALPHA
-        self.last_time = time.time()
-
-        def append_time(id, data, state):
-
-            now = time.time()
-
-            elapsed = now - self.last_time
-
-            if elapsed > self.curr_rate * DEFAULT_CRONO_RATE_MULTIPLIER:
-                self.curr_rate = DEFAULT_CRONO_INITIAL_RATE
-
-            self.curr_rate = self.alpha * (self.curr_rate - elapsed) + elapsed
-            print(f"crono:{name} >: {1/self.curr_rate}")
-
-            # state.append(elapsed)
-
-            self.last_time = now
-
-            return state
-
-        if name is None:
-            name = "Crono"
-
-        super().__init__(func=append_time, initstate=[], name=name)
 
 
 class Combine(Process):
@@ -491,12 +305,12 @@ class Combine(Process):
     Given a depth level this process combines all of the input elements that share a portion of the hierachical key.
     """
 
-    def __init__(self, depth: int = 1, name: str = "combine", unbatch: bool = True):
+    def __init__(self, depth: int = 1, name: str = "combine", unbatch: bool = False):
         """Creates a combine processs given a depth level.
 
         Args:
             depth (int): level of agregation in the hierarchical key. Defaults to 1.
-            unbatch (bool): input stream is batched or not. Defaults to True.
+            unbatch (bool): input stream is batched or not. Defaults to False.
         """
 
         self.depth = depth
@@ -562,7 +376,7 @@ class Combine(Process):
 
                 if total == 1:
 
-                    await output.commit(superkey, {key: data, "count": 1})
+                    await output.commit(superkey, {key: data})
 
                 else:
                     if superkey in cache:
@@ -573,8 +387,17 @@ class Combine(Process):
                         if cache[superkey]["count"] == total:
                             # gathered everything.
                             jointdata = cache.pop(superkey, None)
-
-                            await output.commit(superkey, jointdata)
+                            count = jointdata.pop("count")
+                            
+                            jointdata = {
+                                int(k.split(OF)[0]) : v for k,v in jointdata.items()
+                            }
+                            
+                            sorted_jointdata =   sorted(jointdata.items(), key=lambda x: x[0])
+                            
+                            sorted_jointdata = [ v for k,v in sorted_jointdata ]
+                                                        
+                            await output.commit(superkey, sorted_jointdata)
 
                     else:
                         # sp not in memory.
@@ -835,10 +658,7 @@ class NativeMap(MetaMap):
             many (bool): Whether to do a flat map or not.
         """
 
-        #if DEBUG:
         _func = async_wrap(func)
-        #else:
-        #    _func = remote_wrap(func)
 
         super().__init__(func=_func, many=many, name=name)
 
@@ -849,13 +669,15 @@ class Map(NativeMap):
     It's a Native map with many=False.
     """
 
-    def __init__(self, func: Callable[[Value], Value]):
+    def __init__(self, func: Callable[[Value], Value],name=None):
         """Creates a classic map process.
 
         Args:
             func (function): Function to be applied.
         """
-        super().__init__(func=func, name="map({})".format(format_function(func)), many=False)
+        if name is None:
+            name = "map({})".format(format_function(func))
+        super().__init__(func=func, name=name, many=False)
 
 
 class FlatMap(NativeMap):
@@ -998,25 +820,3 @@ class Aggregate(Junction):
         return len(cache) > 0
 
 
-### I would like to build a function that given some unionprocess turns it into a workflow. 
-
-def convert_to_workflow(process: ProcessUnion) -> WorkFlow:
-    """
-    Given a ProcessUnion, turns it into a Workflow.
-    """
-    
-    class InplaceWorkflow(WorkFlow):
-        def forward(self, *args, **kwargs):
-            return process(*args, **kwargs)
-    
-    return InplaceWorkflow()
-
-def convert_from_bridge(bridge: Bridge) -> WorkFlow:
-    """
-    Given a Bridge, turns it into a Workflow.
-    """
-    class InplaceWorkflow(WorkFlow):
-            def forward(self):
-                return bridge
-        
-    return InplaceWorkflow()

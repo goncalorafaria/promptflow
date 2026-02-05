@@ -76,3 +76,18 @@ def validcheck(f=None):
         return lambda x: f(x) is not None
     else:
         return lambda x: x is not None
+
+# Helper function for cross product
+def cross_product(list1, list2):
+    return [(x, y) for x in list1 for y in list2]
+
+# Helper function to join by key
+def join_by_key(list_of_dicts, key):
+    result = {}
+    for d in list_of_dicts:
+        # Use the rubric object itself as the key
+        key_value = d[key]
+        if key_value not in result:
+            result[key_value] = []
+        result[key_value].append(d)
+    return result

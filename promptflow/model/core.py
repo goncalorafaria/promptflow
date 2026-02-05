@@ -2,22 +2,59 @@ from transformers import AutoTokenizer
 import requests
 import aiohttp
 import asyncio
-import time
 import os
-import logging
 from typing import Any, Union
-from qalign.utils.list import unflatten_list
-
+import logging
 # Import promptflow dependencies
 from promptflow.process import MetaMap
-from promptflow.actor import Actor
-from promptflow.asynchronous import Queue, create_task, gather
-from promptflow.constants import BULLET, DEFAULT_INFLIGHT_BATCH, SEP, OF
-
+from promptflow.constants import DEFAULT_INFLIGHT_BATCH
+from pydantic import BaseModel
+from rubrics.parse import parse_thinking_tokens_qwen
+from rubrics.parse import extract_json_from_response
+from promptflow import Map,  WorkFlow, ListInput
+from typing import List
 ## get env variable DEBUG
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
-class RemoteVLLM:
+
+class LLMResponse:
+    output: str
+    reasoning: str
+    text: str
+    
+    def __init__(self, response: str):
+        self.reasoning, self.output = parse_thinking_tokens_qwen(response)
+        self.text=response
+
+    def __str__(self):
+        return f"LLMResponse(reasoning={self.reasoning}, output={self.output})"
+    
+    def __repr__(self):
+        return f"LLMResponse(reasoning={self.reasoning}, output={self.output})"
+    
+
+class Assertion:
+    def check(self, response: LLMResponse) -> bool:
+        raise NotImplementedError("Subclasses must implement this method")
+
+class HasJson(Assertion):
+
+    def check(self, response: LLMResponse) -> bool:
+        return extract_json_from_response(response.output) is not None
+
+class HasJsonKey(Assertion):
+    def __init__(self, key: str):
+        self.key = key
+    def check(self, response: LLMResponse) -> bool:
+        json_response = extract_json_from_response(response.output)
+        if json_response is None:
+            return False
+        else:
+            return self.key in json_response
+
+
+
+class RemoteLLMClient:
     def __init__(
         self,
         server_url: str,
@@ -61,28 +98,21 @@ class RemoteVLLM:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.bos_token_id
             self.tokenizer.pad_token = self.tokenizer.bos_token
-        
-
-
-    def encode(self, prompt_txt):
-        tokens = self.tokenize(prompt_txt)
-        return tokens
-
-    def tokenize(self, prompt, **tokenizer_kwargs):
-        return [
-            self.tokenizer.encode(
-                p,
-                max_length=self.max_prompt_length+self.max_new_tokens,
-                truncation=True,
-                add_special_tokens=False,
-                **tokenizer_kwargs
-            )
-            for p in prompt
-        ]
+            
     
-    def decode_tokenize(self, ids): 
-        return self.tokenizer.batch_decode(ids, skip_special_tokens=False, spaces_between_special_tokens=False)
-
+    def _prep_prompt(self, chat_template_prompt, add_generation_prompt=False):
+        
+        prompt = self.tokenizer.apply_chat_template(
+            chat_template_prompt,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,#False#not any([ ct["role"] == "assistant" for ct in chat_template_prompt ]) ,
+        )
+        
+        tokens = self.tokenizer.encode(prompt, max_length=self.max_prompt_length, truncation=True)
+        truncated_prompt = self.tokenizer.decode(tokens, skip_special_tokens=False)
+                
+        return truncated_prompt
+    
     def _truncate_tokens(self, tokenized_input):
         """
         Truncate tokenized input if it exceeds max_prompt_length.
@@ -116,10 +146,6 @@ class RemoteVLLM:
         except Exception as e:
             raise ConnectionError(f"Server health check failed: {str(e)}")
 
-    def _post_with_retries(self, endpoint, payload, use_tqdm=False):
-        """Synchronous wrapper for async POST requests with retries."""
-        return asyncio.run(self._post_with_retries_async(endpoint, payload, use_tqdm=use_tqdm))
-    
     async def _post_with_retries_async(self, endpoint, payload, use_tqdm=False):
         """
         Submit requests with retry logic and connection pooling.
@@ -198,141 +224,70 @@ class RemoteVLLM:
         
         return flattened_results
 
-    async def _post_with_retries_async_original(self, endpoint, payload):
-        """Original approach: separate session for each request"""
-        async def _make_request_with_retries(p):
-            for attempt in range(self.max_retries):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            f"{self.server_url}{endpoint}",
-                            json=p,
-                            timeout=aiohttp.ClientTimeout(total=self.timeout),
-                        ) as resp:
-                            resp.raise_for_status()
-                            data = await resp.json()
-                            if isinstance(data, dict):
-                                data = [data]
-                            return data
-                except Exception as e:
-                    if attempt == self.max_retries - 1:
-                        raise RuntimeError(f"Request failed after {self.max_retries} attempts: {e}")
-                    await asyncio.sleep(1)
+    async def invoke(self, chat_template_prompt, n=1) -> list[str]:
         
-        # Create tasks for all requests and run them concurrently
-        tasks = [_make_request_with_retries(p) for p in payload]
-        results = await asyncio.gather(*tasks)
+        formatted_prompt = self._prep_prompt(chat_template_prompt, add_generation_prompt=True)
+                
+      
         
-        # Flatten results
-        flattened_results = []
-        for result in results:
-            flattened_results.extend(result)
+        payload = self._build_ancestral_payload([formatted_prompt], n=n)
         
-        return flattened_results
+        # Call ancestral method - expects text input
+        result = await self._post_with_retries_async(
+            "/v1/completions",
+            payload,
+            use_tqdm=False,
+        )
+     
+        completions = [
+            LLMResponse(response=choice["text"])
+            for r in result
+            for choice in r.get("choices", [])
+        ]
+        return completions
+  
+    def _build_ancestral_payload(self, prompts, n: int = 1):
+        """Build payload for ancestral method."""
+        # Expand prompts by n
+        expanded_prompts = []
+        for prompt in prompts:
+            expanded_prompts.extend([prompt] * n)
+
+        return [
+            {
+                "model": self.model_path,
+                "prompt": p,
+                "max_tokens": self.max_new_tokens,
+                "temperature": self.temperature,
+                "n": 1,
+                "stop": self.stop_tokens,
+            }
+            for p in expanded_prompts
+        ]
+
 
     def _get(self, endpoint):
         request = requests.get(f"{self.server_url}{endpoint}", timeout=self.timeout)
         request.raise_for_status()
         return request.json()
     
-    
-    def continuation(self, prompt, prefix=None, use_tqdm=False):
-        if prefix is None:
-            input_data = prompt
-        else:
-            input_data = [x[0] + x[1] for x in zip(prompt, prefix)]
-        
-        # Truncate all inputs to max_prompt_length
-        input_data = [self._truncate_tokens(x) for x in input_data]
-
-        #prompt_text = self.decode_tokenize(
-        #    input_data, skip_special_tokens=True, spaces_between_special_tokens=False
-        #)
-        lengths = [len(x) for x in input_data]
-        #print("lengths-prefix:",lengths)
-         ## skip special tokens at False was causing major issues.
-        prompt_text = self.decode_tokenize(input_data)
-        
-       
-
-        payload = [
-            {
-                "model": self.model_path,
-                "prompt": p,
-                "temperature": self.temperature,
-                "logprobs": 1,
-                "max_tokens": self.max_new_tokens,
-                "stop": self.stop_tokens,
-            }
-            for p in prompt_text
-        ]
-
-        if DEBUG:
-            print("model_packet:",payload[0])
-
-        results = self._post_with_retries("/v1/completions", payload, use_tqdm=use_tqdm)
-
-        completions = [
-            choice["text"] 
-            for result in results
-            for choice in result.get("choices", [])
-        ]
-
-        completion_ids = [xi for xi in self.tokenize(completions)]
-        #print("lengths-completion:",[len(xi) for xi in completion_ids])
-        
-        return completion_ids 
-
-    def ancestral(
-        self,
-        input_data,
-        n: int = 1,
-        use_tqdm=False,
-    ):
-        # Truncate input_data (text) by tokenizing, truncating, then decoding
-        tokenized_data = []
-        for prompt in input_data:
-            tokens = self.tokenizer.encode(prompt, max_length=self.max_prompt_length, truncation=True)
-            truncated_prompt = self.tokenizer.decode(tokens, skip_special_tokens=False)
-            tokenized_data.append(truncated_prompt)
-        
-        prompts = []
-        for prompt in tokenized_data: 
-            prompts.extend([prompt] * n)
-
-        payload = [
-            {
-                "model": self.model_path,
-                "prompt": p,
-                "max_tokens": self.max_new_tokens,
-                "temperature": self.temperature, 
-                "n": 1,
-                "stop": self.stop_tokens,
-            }
-            for p in prompts
-        ]
-
-        results = self._post_with_retries("/v1/completions", payload, use_tqdm=use_tqdm)
-
-        completions = [
-            choice["text"] for result in results for choice in result.get("choices", [])
-        ]
-        return unflatten_list(completions, [n] * len(input_data))
 
     def __str__(self):
         return f"RemoteVLLM(model_path={self.model_path}, server_url={self.server_url})"
 
 
-class VLLMMap(MetaMap):
+class LLMMap(MetaMap):
     """Applies a vLLM model's ancestral method to each element of the input stream asynchronously."""
 
     def __init__(
         self,
-        vllm_client: RemoteVLLM,
-        n: int = 1,
+        vllm_client:RemoteLLMClient,
         name: Union[str, None] = None,
-        many: bool = False,
+        n=1,
+        input_key: str = "llm_call_input",
+        output_key: str = "llm_call_output",
         inflight_batch: int = DEFAULT_INFLIGHT_BATCH,
+        assertions: List[Assertion] = None,
     ):
         """Creates a vLLM map process using the ancestral method.
 
@@ -347,105 +302,91 @@ class VLLMMap(MetaMap):
         self.vllm_client = vllm_client
         self.n = n
         self.inflight_batch = inflight_batch
-
+        self.input_key = input_key
+        self.output_key = output_key
+        self.assertions = assertions
         if name is None:
             name = f"VLLMMap:{vllm_client.model_path}:ancestral"
 
-        # Create async wrapper function using closure to capture instance variables
-        vllm_client_ref = vllm_client
-        n_ref = n
-
-        async def vllm_func(data: Any) -> Any:
-            """Async wrapper that calls the ancestral method on RemoteVLLM."""
-            return await self._vllm_process_impl(data, vllm_client_ref, n_ref)
-
         # Initialize parent with the async function
-        super().__init__(func=vllm_func, many=many, name=name)
+        super().__init__(func=self._vllm_process_impl, name=name, many=False)
 
     async def _vllm_process_impl(
-        self, data: str, vllm_client: RemoteVLLM,
+        self, data: Any
     ) -> Any:
-        """Async implementation that calls the ancestral method on RemoteVLLM."""
-        # Prepare input: data can be a string or list of strings
-        prompt = [data]
+        """Async implementation that calls the ancestral method on RemoteVLLM.
         
-        # Call ancestral method - expects text input
-        result = await vllm_client._post_with_retries_async(
-            "/v1/completions",
-            self._build_ancestral_payload(vllm_client, prompt, n=1),
-            use_tqdm=False,
+        Args:
+            data: Chat template format (list of message dicts, e.g., [{"role": "user", "content": "..."}])
+            vllm_client: RemoteVLLM client instance
+        """
+ 
+        completions =await self.vllm_client.invoke(
+            data[self.input_key], n=self.n)
+
+        if self.assertions is not None:
+            for assertion in self.assertions:
+                
+                all_checks =[ assertion.check(completion) for completion in completions ]
+                
+                if not all(all_checks):
+                    # have to implement some level of retry here. 
+                    raise ValueError(f"Assertion {assertion} failed for completions: {completions}")
+                
+        if self.output_key in data:
+            logging.warning(f"output key {self.output_key} already in input data, will be overwritten")
+            
+            
+        return { **data, self.output_key: completions }
+
+
+
+class LLMResponseGenerator(WorkFlow):
+    """Workflow that generates responses to questions using VLLM Map."""
+
+    def __init__(self, vllm_client: RemoteLLMClient, prompt_key: str = "prompt", prompt_template: None = None, n: int = 1):
+        """Initialize the workflow with a VLLM client.
+        
+        Args:
+            vllm_client: RemoteVLLM client instance
+        """
+        self.vllm_client = vllm_client
+        self.prompt_key = prompt_key
+        self.prompt_template = prompt_template
+        self.n = n
+        super().__init__()
+        
+        self.parse_prompt_and_generate_responses = Map(
+            func=lambda x: {
+                "input_prompt_chat_template": self.prompt_template(x[self.prompt_key]) if self.prompt_template is not None else x[self.prompt_key], 
+                "input_prompt": x[self.prompt_key]
+            }
+                 ) | LLMMap(
+            vllm_client=self.vllm_client,
+            input_key="input_prompt_chat_template",
+            output_key="responses",
+            n=self.n,
         )
         
-        completions = [
-            choice["text"]
-            for r in result
-            for choice in r.get("choices", [])
-        ]
-        return completions
+        self.parse_responses = Map(func=lambda x: {
+            "responses": [ r.output for r in x["responses"]],
+            self.prompt_key: x["input_prompt"]
+        })
 
-    def _build_ancestral_payload(self, vllm_client: RemoteVLLM, prompts, n: int = 1):
-        """Build payload for ancestral method."""
-        # Expand prompts by n
-        expanded_prompts = []
-        for prompt in prompts:
-            expanded_prompts.extend([prompt] * n)
-
-        return [
-            {
-                "model": vllm_client.model_path,
-                "prompt": p,
-                "max_tokens": vllm_client.max_new_tokens,
-                "temperature": vllm_client.temperature,
-                "n": 1,
-                "stop": vllm_client.stop_tokens,
-            }
-            for p in expanded_prompts
-        ]
-
-    async def execute(self, input: Actor, output: Actor) -> bool:
-        """Executes the vLLM mapping process.
-
+    def forward(self, input_questions):
+        """Generate responses for the input questions.
+        
         Args:
-            input (Actor): Input actor stream to consume.
-            output (Actor): Output actor stream to produce.
-
+            input_questions: List of chat template format questions 
+                           (e.g., [[{"role":"user","content":"..."}], ...])
+            
         Returns:
-            bool: True if successful.
+            Process result that can be run to get responses
         """
+        # Create an iterable from the input questions (already in chat template format)
+        a = ListInput(input_questions)
+        
+        outputs_responses = self.parse_responses(self.parse_prompt_and_generate_responses(a))
+        
+        return outputs_responses
 
-        inflight = Queue(maxsize=self.inflight_batch)
-
-        logging.debug(f"Launching task: {self.name}")
-        st = time.time()
-
-        runs = []
-
-        async for id, data in input.iterable(output):
-
-            logging.debug(f"Task {self.name}: instance {id}; ")
-
-            if BULLET in id:
-                # Skip processing for bullet items
-                await output.commit(id, data)
-            else:
-                await inflight.put(1)
-
-                runs.append(
-                    create_task(
-                        self.func_applier(
-                            func=self.func,
-                            id=id,
-                            data=data,
-                            output=output,
-                            unsubscribe=inflight,
-                        )
-                    )
-                )
-
-        await gather(*runs)
-        await output.stop()
-
-        logging.debug(f"Finished launching task: {self.name}. Syncing runs.")
-        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
-
-        return True

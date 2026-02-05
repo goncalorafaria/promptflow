@@ -1,5 +1,6 @@
 import os
 from typing import Any
+import logging
 
 # String separators for key encoding
 STOP = None
@@ -12,7 +13,7 @@ CTRL = "?"
 
 """default minimum resolution for video frames"""
 
-DEFAULT_BATCH = 8
+DEFAULT_BATCH = 1024
 
 """
 This parameter controls, for each local stage, 
@@ -30,7 +31,7 @@ Large batch :
 
 MAX_BUFFER_SIZE = 10000000
 
-DEFAULT_INFLIGHT_BATCH = 32
+DEFAULT_INFLIGHT_BATCH = 1024
 
 """
 This parameter controls, for each remote stage, 
@@ -44,11 +45,10 @@ Let the autoscalar and loadbalancer deal with it.
 """
 
 # Debug configuration
-DEBUG = os.getenv("PROMPTFLOW_DEBUG", "True").lower() == "true"
-"""
-    This is significantly less efficient. But makes it easier to debug.
-    Can be configured via PROMPTFLOW_DEBUG environment variable.
-"""
+DEBUG = os.getenv("DEBUG", "False").lower() == "true" or int(os.getenv("DEBUG", "0"))==1
+
+
+logging.basicConfig(level=logging.DEBUG if DEBUG else logging.INFO)
 
 WORKER_LOG_SPLIT = "*" * 40
 
