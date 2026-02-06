@@ -1,0 +1,11 @@
+aiohttp>=3.8.0
+transformers>=4.30.0
+pydantic>=2.0.0
+requests>=2.28.0
+networkx>=3.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+
+# Optional: for OpenAI/ChatGPT support
+openai>=1.0.0
+
