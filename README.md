@@ -75,10 +75,11 @@ Processes transform data streams. Chain them with `|`:
 |---------|-------------|
 | `Map(func)` | Apply function to each element |
 | `FlatMap(func)` | Apply function that returns a list, flatten results |
+| `LLMMap(client, input_key, output_key)` | Call LLM on each element, write response back |
 | `Combine(depth)` | Gather scattered elements back together |
 | `Aggregate(key_factory)` | Group elements by key |
 | `Barrier(func)` | Synchronization point, process elements in order |
-| `Batching(size)` | Collect elements into batches |
+| `Batching(size)` / `UnBatching()` | Collect elements into batches / expand batches back |
 
 ### LLM Operations
 
@@ -96,16 +97,65 @@ vllm = RemoteLLMClient(
 
 # For OpenAI
 openai = ChatGPTClient(model="gpt-4o")
+```
 
-# Use in pipeline with automatic retries and assertions
-llm_step = LLMMap(
-    vllm_client=vllm,
-    n=1,                              # Completions per input
+### LLMMap
+
+The core operation for LLM inference in your pipeline. It reads a prompt from your data, calls the model, and writes the response back.
+
+```python
+LLMMap(
+    vllm_client,                      # RemoteLLMClient or ChatGPTClient
+    input_key="llm_call_input",       # Key to read chat template from
+    output_key="llm_call_output",     # Key to write LLMResponse to
+    n=1,                              # Number of completions per input
+    assertions=[...],                 # Optional: validate outputs
+    max_correctness_attempts=3        # Retry count if assertions fail
+)
+```
+
+**Data flow:**
+
+```python
+# Input dict
+{"llm_call_input": [{"role": "user", "content": "..."}], "other_field": ...}
+
+# After LLMMap
+{"llm_call_input": [...], "other_field": ..., "llm_call_output": [LLMResponse, ...]}
+```
+
+**LLMResponse object:**
+
+Each completion returns an `LLMResponse` with:
+- `.output` — The model's response (with thinking tokens stripped if present)
+- `.reasoning` — Extracted chain-of-thought/thinking content (for models like Qwen)
+- `.text` — Raw full response
+- `.valid` — `True` unless an assertion failed
+
+**Assertions for structured outputs:**
+
+```python
+from promptflow.model import HasJson, HasJsonKey
+
+LLMMap(
+    vllm_client=client,
     input_key="prompt",
     output_key="response",
-    assertions=[HasJson()],           # Retry if no JSON in output
-    max_correctness_attempts=3
+    assertions=[
+        HasJson(),              # Response must contain valid JSON
+        HasJsonKey("score"),    # JSON must have "score" key
+    ],
+    max_correctness_attempts=3  # Retry up to 3x if assertions fail
 )
+```
+
+**Multiple completions with `n`:**
+
+```python
+# Generate 5 candidate responses per input
+LLMMap(vllm_client=client, n=5, input_key="prompt", output_key="candidates")
+
+# output_key will contain a list of 5 LLMResponse objects
 ```
 
 ```
