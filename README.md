@@ -157,8 +157,7 @@ LLMMap(vllm_client=client, n=5, input_key="prompt", output_key="candidates")
 
 # output_key will contain a list of 5 LLMResponse objects
 ```
-
-```
+ 
 
 ## How It Works
 
