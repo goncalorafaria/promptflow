@@ -5,8 +5,11 @@ import logging
 import time
 from functools import partial, reduce
 from typing import Any, Callable, List, Tuple, Union
+from tqdm.auto import tqdm
+from threading import Lock
 
 from promptflow.actor import Actor, Control, try_to_convert_to_input
+
 # internal imports
 from promptflow.asynchronous import Queue, async_wrap, create_task, gather
 from promptflow.constants import (
@@ -55,7 +58,7 @@ async def func_applier_many(
         await output.commit(f"{id}{SEP}{i}{OF}{n}", output_data)
 
     # This guarantees that the buffer is bounded.
-    if unsubscribe: 
+    if unsubscribe:
         _ = await unsubscribe.get()
 
 
@@ -98,7 +101,7 @@ class Process:
         """
         self.name = name
 
-    def __call__(self, node: Union[Actor,Any]) -> Actor:
+    def __call__(self, node: Union[Actor, Any]) -> Actor:
         """Applies the process to a input actor stream.
 
         Args:
@@ -108,7 +111,7 @@ class Process:
             outputnode (Actor): Output actor stream.
         """
         node = try_to_convert_to_input(node)
-        
+
         outnode = Bridge(
             # f"{node}{SEP}{self.name}{SEP}",
             self.name,
@@ -136,10 +139,11 @@ class Process:
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.name})"
-    
+
     def __str__(self):
         return self.__repr__()
-    
+
+
 class ProcessUnion(Process):
     def __init__(self, process1, process2):
         super().__init__(name="{}-> {}".format(process1.name, process2.name))
@@ -172,14 +176,13 @@ class Bridge(Actor):
             Tuple[Process,List[Actor]]: _description_
         """
         return self.op, self.parents
-    
+
     def __call__(self):
         return self.run()
-    
-    
+
     def run(self):
         raise NotImplementedError("No bridge workflows for now.")
-        #return convert_from_bridge(self)()
+        # return convert_from_bridge(self)()
 
 
 class Junction(Process):
@@ -194,7 +197,7 @@ class Junction(Process):
 
         super().__init__(name)
 
-    def __call__(self, *nodes: Union[Actor,Any]) -> Actor:
+    def __call__(self, *nodes: Union[Actor, Any]) -> Actor:
         """_summary_
 
         Args:
@@ -205,7 +208,7 @@ class Junction(Process):
         """
 
         nodes = [try_to_convert_to_input(n) for n in nodes]
-        
+
         outnode = Bridge(
             # f"{nodes}{SEP}{self.name}{SEP}",
             self.name,
@@ -243,12 +246,10 @@ class MetaMap(Process):
 
         super().__init__(name)
         self.func = func
-        if many: # for flatMaps
-            self.func_applier =  func_applier_many
+        if many:  # for flatMaps
+            self.func_applier = func_applier_many
         else:
-            self.func_applier =  func_applier
-
-        
+            self.func_applier = func_applier
 
     async def execute(self, input: Actor, output: Actor) -> bool:
         """Executes the mapping process.
@@ -280,7 +281,13 @@ class MetaMap(Process):
 
                 runs.append(
                     create_task(
-                        self.func_applier(func=self.func, id=id, data=data, output=output, unsubscribe=inflight)
+                        self.func_applier(
+                            func=self.func,
+                            id=id,
+                            data=data,
+                            output=output,
+                            unsubscribe=inflight,
+                        )
                     )
                 )
 
@@ -295,8 +302,6 @@ class MetaMap(Process):
         logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
 
         return True
-
-
 
 
 class Combine(Process):
@@ -388,15 +393,17 @@ class Combine(Process):
                             # gathered everything.
                             jointdata = cache.pop(superkey, None)
                             count = jointdata.pop("count")
-                            
+
                             jointdata = {
-                                int(k.split(OF)[0]) : v for k,v in jointdata.items()
+                                int(k.split(OF)[0]): v for k, v in jointdata.items()
                             }
-                            
-                            sorted_jointdata =   sorted(jointdata.items(), key=lambda x: x[0])
-                            
-                            sorted_jointdata = [ v for k,v in sorted_jointdata ]
-                                                        
+
+                            sorted_jointdata = sorted(
+                                jointdata.items(), key=lambda x: x[0]
+                            )
+
+                            sorted_jointdata = [v for k, v in sorted_jointdata]
+
                             await output.commit(superkey, sorted_jointdata)
 
                     else:
@@ -649,7 +656,7 @@ class NativeMap(MetaMap):
         self,
         func: Callable[[Value], Value],
         name: Union[str, None] = None,
-        many: bool=False
+        many: bool = False,
     ):
         """Create a native map process.
 
@@ -669,7 +676,7 @@ class Map(NativeMap):
     It's a Native map with many=False.
     """
 
-    def __init__(self, func: Callable[[Value], Value],name=None):
+    def __init__(self, func: Callable[[Value], Value], name=None):
         """Creates a classic map process.
 
         Args:
@@ -820,3 +827,85 @@ class Aggregate(Junction):
         return len(cache) > 0
 
 
+class Filter(Process):
+    """Pass through only items whose predicate returns true."""
+
+    def __init__(
+        self,
+        predicate: Callable[[Value], bool],
+        name: Union[str, None] = None,
+    ):
+        if name is None:
+            name = "filter({})".format(format_function(predicate))
+        super().__init__(name=name)
+        self.predicate = predicate
+
+    async def execute(self, input: Actor, output: Actor) -> bool:
+        logging.debug(f"Launching task: {self.name}")
+        st = time.time()
+
+        async for id, data in input.iterable(output):
+            logging.debug(f"Task {self.name}: instance {id}; ")
+            if self.predicate(data):
+                await output.commit(id, data)
+
+        await output.stop()
+
+        logging.debug(f"Finished launching task: {self.name}.")
+        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
+        return True
+
+
+class TqdmProgressState:
+    def __init__(
+        self,
+        *,
+        desc: str = "Generation workflow",
+        unit: str = "row",
+        disable: bool = False,
+    ) -> None:
+        self.desc = desc
+        self.unit = unit
+        self.disable = disable
+        self._lock = Lock()
+        self._pbar: Any | None = None
+        self._total: int | None = None
+
+    def start(self, total: int) -> None:
+        with self._lock:
+            if self._pbar is not None:
+                self._pbar.close()
+            self._total = total
+            self._pbar = tqdm(
+                total=total,
+                desc=self.desc,
+                unit=self.unit,
+                disable=self.disable,
+            )
+
+    def update(self) -> None:
+        with self._lock:
+            if self._pbar is not None:
+                self._pbar.update(1)
+                if self._total is not None and self._pbar.n >= self._total:
+                    self._pbar.close()
+                    self._pbar = None
+
+
+class TqdmProgressMap(MetaMap):
+    def __init__(
+        self,
+        state: TqdmProgressState,
+        *,
+        name: str,
+    ) -> None:
+        self.state = state
+        super().__init__(
+            func=self._progress_impl,
+            name=name,
+            many=False,
+        )
+
+    async def _progress_impl(self, data: dict[str, Any]) -> dict[str, Any]:
+        self.state.update()
+        return data

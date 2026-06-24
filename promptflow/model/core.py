@@ -44,6 +44,12 @@ class Assertion:
     def check(self, response: LLMResponse) -> bool:
         raise NotImplementedError("Subclasses must implement this method")
 
+    async def acheck(self, response: LLMResponse, data: Any = None) -> bool:
+        result = self.check(response)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
+
 class HasJson(Assertion):
 
     def check(self, response: LLMResponse) -> bool:
@@ -84,11 +90,28 @@ class RemoteLLMClient:
         timeout: float = 300,
         max_retries: int = 15,
         max_concurrent_requests: int = 256,
+        tokenizer_path: str = None,
+        enable_thinking: bool = False,
     ):
+        """
+        Initialize the RemoteLLMClient.
         
+        Args:
+            server_url: The URL of the remote LLM server.
+            model_path: The path to the model.
+            max_new_tokens: The maximum number of tokens in the response.
+            max_prompt_length: The maximum length of the prompt.
+            stop_tokens: The tokens to stop the response.
+            temperature: The temperature of the response.
+            timeout: The timeout for the request.
+            max_retries: The maximum number of retries for the request.
+            max_concurrent_requests: The maximum number of concurrent requests.
+            tokenizer_path: The path to the tokenizer.
+            enable_thinking: Whether to enable thinking.
+        """
         self.server_url = server_url.rstrip("/")
-       
-    
+
+        self.enable_thinking = enable_thinking
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.max_prompt_length = max_prompt_length - 1
@@ -104,7 +127,7 @@ class RemoteLLMClient:
 
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path,
+            self.model_path if tokenizer_path is None else tokenizer_path,
             padding_side="left",
         )
         
@@ -124,6 +147,8 @@ class RemoteLLMClient:
             chat_template_prompt,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,#False#not any([ ct["role"] == "assistant" for ct in chat_template_prompt ]) ,
+            enable_thinking=self.enable_thinking,
+            
         )
         
         tokens = self.tokenizer.encode(prompt, max_length=self.max_prompt_length, truncation=True)
@@ -205,7 +230,11 @@ class RemoteLLMClient:
                             return data
                     except Exception as e:
                         if attempt == self.max_retries - 1:
-                            raise RuntimeError(f"Request failed after {self.max_retries} attempts: {e}")
+                            logging.warning(
+                                "Request failed after %d attempts (returning None): %s",
+                                self.max_retries, e
+                            )
+                            return None
                         await asyncio.sleep(1)
             
             # Limit concurrent requests using a semaphore
@@ -235,10 +264,11 @@ class RemoteLLMClient:
             else:
                 results = await asyncio.gather(*tasks)
         
-        # Flatten results
+        # Flatten results (skip None from failed/timeout requests)
         flattened_results = []
         for result in results:
-            flattened_results.extend(result)
+            if result is not None:
+                flattened_results.extend(result)
         
         return flattened_results
 
@@ -262,6 +292,9 @@ class RemoteLLMClient:
             for r in result
             for choice in r.get("choices", [])
         ]
+        # On timeout/failure, result is empty; return invalid response so downstream gets None
+        if not completions:
+            return [LLMResponse(response="").make_invalid()]
         return completions
   
     def _build_ancestral_payload(self, prompts, n: int = 1):
@@ -303,7 +336,7 @@ class ChatGPTClient:
         model: str = "gpt-4o",
         max_new_tokens: int = 1024,
         stop_tokens: list = None,
-        timeout: float = 300,
+        timeout: float = 500,
         max_retries: int = 15,
         max_concurrent_requests: int = 64,
         base_url: str = None,
@@ -445,13 +478,16 @@ class LLMMap(MetaMap):
         
         if self.assertions is not None:
             for assertion in self.assertions:
-                
-                all_checks =[ assertion.check(completion) for completion in completions ]
-                
-                new_completions = [ ]
-                
-                for completion in completions:
-                    if assertion.check(completion):
+
+                all_checks = [
+                    await assertion.acheck(completion, data=data)
+                    for completion in completions
+                ]
+
+                new_completions = []
+
+                for completion, check_passed in zip(completions, all_checks):
+                    if check_passed:
                         new_completions.append(completion)
                     else:
                         new_completions.append(completion.make_invalid())
@@ -525,4 +561,3 @@ class LLMResponseGenerator(WorkFlow):
         outputs_responses = self.parse_responses(self.parse_prompt_and_generate_responses(a))
         
         return outputs_responses
-
