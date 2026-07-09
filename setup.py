@@ -8,7 +8,7 @@ with open("requirements.txt", "r") as fr:
 
 setuptools.setup(
     name="promptflow",
-    version="0.0.1",
+    version="0.0.3",
     author="Goncalo Faria",
     author_email="goncalofaria.research@gmail.com",
     description="A package for building and running workflows.",

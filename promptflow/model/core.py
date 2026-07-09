@@ -9,7 +9,7 @@ import logging
 from promptflow.process import MetaMap
 from promptflow.constants import DEFAULT_INFLIGHT_BATCH
 from pydantic import BaseModel
-from promptflow.utils import extract_json_from_response, parse_thinking_tokens_qwen
+from rubrics.parse import extract_json_from_response, parse_thinking_tokens_qwen
 from promptflow import Map,  WorkFlow, ListInput
 from typing import List
 ## get env variable DEBUG
