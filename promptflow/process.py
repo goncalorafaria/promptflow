@@ -11,7 +11,13 @@ from threading import Lock
 from promptflow.actor import Actor, Control, try_to_convert_to_input
 
 # internal imports
-from promptflow.asynchronous import Queue, async_wrap, create_task, gather
+from promptflow.asynchronous import (
+    Queue,
+    async_wrap,
+    create_task,
+    gather,
+    process_wrap,
+)
 from promptflow.constants import (
     BRANCH,
     BULLET,
@@ -34,12 +40,79 @@ from promptflow.remote import HttpSession, request_broadcast, trace_config
 from promptflow.functools import format_function
 
 
+class StageTiming:
+    """Collect wall-clock, CPU, and per-item timings for a process stage.
+
+    ``avg_item`` / ``max_item`` are end-to-end wall latency per item (includes
+    awaits). ``cpu`` is process CPU time over the stage; ``cpu_ratio = cpu/wall``
+    is the signal for CPU-bound vs await/IO-bound:
+
+    - cpu_ratio near 1.0 → mostly CPU-bound
+    - cpu_ratio near 0.0 → mostly waiting (LLM/network/locks)
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.wall_start = time.perf_counter()
+        self.cpu_start = time.process_time()
+        self._lock = Lock()
+        self.count = 0
+        self.item_total_s = 0.0
+        self.item_max_s = 0.0
+
+    def record_item(self, elapsed_s: float) -> None:
+        with self._lock:
+            self.count += 1
+            self.item_total_s += elapsed_s
+            if elapsed_s > self.item_max_s:
+                self.item_max_s = elapsed_s
+
+    def log(self, *, per_item: bool = True) -> None:
+        wall_s = time.perf_counter() - self.wall_start
+        cpu_s = time.process_time() - self.cpu_start
+        cpu_ratio = (cpu_s / wall_s) if wall_s > 0 else 0.0
+        n = self.count
+        if per_item and n > 0:
+            avg = self.item_total_s / n
+            logging.info(
+                "Duration: [%s] wall=%.3fs cpu=%.3fs cpu_ratio=%.2f "
+                "n=%d avg_item=%.3fs max_item=%.3fs",
+                self.name,
+                wall_s,
+                cpu_s,
+                cpu_ratio,
+                n,
+                avg,
+                self.item_max_s,
+            )
+        elif n > 0:
+            logging.info(
+                "Duration: [%s] wall=%.3fs cpu=%.3fs cpu_ratio=%.2f "
+                "n=%d avg_item=%.3fs",
+                self.name,
+                wall_s,
+                cpu_s,
+                cpu_ratio,
+                n,
+                wall_s / n,
+            )
+        else:
+            logging.info(
+                "Duration: [%s] wall=%.3fs cpu=%.3fs cpu_ratio=%.2f n=0",
+                self.name,
+                wall_s,
+                cpu_s,
+                cpu_ratio,
+            )
+
+
 async def func_applier_many(
     func,
     id: str,
     data: Any,
     output: Actor,
     unsubscribe: Union[Queue, None] = None,
+    timing: Union[StageTiming, None] = None,
 ) -> bool:
     """This function applies a function to a sequence of elements and adds each element to the output actor stream.
 
@@ -51,11 +124,16 @@ async def func_applier_many(
         unsubscribe (Union[Queue, None]) : Unsubscribe queue.
     """
 
-    outputs = await func(data)
-    n = len(outputs)
+    item_st = time.perf_counter()
+    try:
+        outputs = await func(data)
+        n = len(outputs)
 
-    for i, output_data in enumerate(outputs):
-        await output.commit(f"{id}{SEP}{i}{OF}{n}", output_data)
+        for i, output_data in enumerate(outputs):
+            await output.commit(f"{id}{SEP}{i}{OF}{n}", output_data)
+    finally:
+        if timing is not None:
+            timing.record_item(time.perf_counter() - item_st)
 
     # This guarantees that the buffer is bounded.
     if unsubscribe:
@@ -68,6 +146,7 @@ async def func_applier(
     data: Any,
     output: Actor,
     unsubscribe: Union[Queue, None] = None,
+    timing: Union[StageTiming, None] = None,
 ) -> bool:
     """This function applies a function to a single element and awaits the result.
     func (function): Function to be applied. ( Any -> Any )
@@ -77,9 +156,13 @@ async def func_applier(
     unsubscribe (Union[Queue, None]) : Rate Limiter Queue.
     """
 
-    output_data = await func(data)
-
-    await output.commit(id, output_data)
+    item_st = time.perf_counter()
+    try:
+        output_data = await func(data)
+        await output.commit(id, output_data)
+    finally:
+        if timing is not None:
+            timing.record_item(time.perf_counter() - item_st)
 
     # This guarantees that the buffer is bounded.
     if unsubscribe:
@@ -265,7 +348,7 @@ class MetaMap(Process):
         inflight = Queue(maxsize=DEFAULT_BATCH)
 
         logging.debug(f"Launching task: {self.name}")
-        st = time.time()
+        timing = StageTiming(self.name)
 
         runs = []
 
@@ -287,6 +370,7 @@ class MetaMap(Process):
                             data=data,
                             output=output,
                             unsubscribe=inflight,
+                            timing=timing,
                         )
                     )
                 )
@@ -299,7 +383,7 @@ class MetaMap(Process):
         await output.stop()
 
         logging.debug(f"Finished launching task: {self.name}. Syncing runs.")
-        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
+        timing.log(per_item=True)
 
         return True
 
@@ -650,7 +734,7 @@ class UnBatching(Process):
 
 
 class NativeMap(MetaMap):
-    """Applies a function in another process in this machine and async waits for the result."""
+    """Apply a synchronous function in the default thread executor."""
 
     def __init__(
         self,
@@ -671,7 +755,7 @@ class NativeMap(MetaMap):
 
 
 class Map(NativeMap):
-    """Applies a function another process in this machine and async waits for the result.
+    """Apply a function in the default thread executor and await its result.
 
     It's a Native map with many=False.
     """
@@ -697,6 +781,47 @@ class FlatMap(NativeMap):
             func (function): Function to be applied.
         """
         super().__init__(func=func, many=True)
+
+
+class ProcessNativeMap(MetaMap):
+    """Apply synchronous CPU-bound work in the shared process pool.
+
+    Unlike :class:`NativeMap`, this serializes callbacks with ``cloudpickle`` so
+    work runs in separate Python processes and can use multiple CPU cores.
+    Inputs and return values must be transferable through process-pool IPC.
+    """
+
+    def __init__(
+        self,
+        func: Callable[[Value], Value],
+        name: Union[str, None] = None,
+        many: bool = False,
+    ):
+        if name is None:
+            name = f"process_map:{format_function(func)}"
+        super().__init__(func=process_wrap(func), many=many, name=name)
+
+
+class ProcessMap(ProcessNativeMap):
+    """A one-to-one CPU-bound map executed in the shared process pool."""
+
+    def __init__(self, func: Callable[[Value], Value], name=None):
+        if name is None:
+            name = "process_map({})".format(format_function(func))
+        super().__init__(func=func, name=name, many=False)
+
+
+class ProcessFlatMap(ProcessNativeMap):
+    """A CPU-bound flat map executed in the shared process pool."""
+
+    def __init__(
+        self,
+        func: Callable[[Value], List[Value]],
+        name: Union[str, None] = None,
+    ):
+        if name is None:
+            name = "process_flat_map({})".format(format_function(func))
+        super().__init__(func=func, name=name, many=True)
 
 
 class RemoteMap(MetaMap):
@@ -745,7 +870,7 @@ class RemoteMap(MetaMap):
         inflight = Queue(maxsize=self.inflight_batch)
 
         logging.debug(f"Launching task: {self.name}")
-        st = time.time()
+        timing = StageTiming(self.name)
 
         runs = []
 
@@ -770,6 +895,7 @@ class RemoteMap(MetaMap):
                                 data,
                                 output,
                                 inflight,
+                                timing,
                             )
                         )
                     )
@@ -784,7 +910,7 @@ class RemoteMap(MetaMap):
             await output.stop()
 
         logging.debug(f"Finished launching task: {self.name}.")
-        logging.info(f"Duration: [{self.name}] : {(time.time() - st):.3f} ")
+        timing.log(per_item=True)
 
         return True
 

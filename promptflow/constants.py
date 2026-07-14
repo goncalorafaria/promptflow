@@ -45,11 +45,26 @@ In a operacionalzied scenario, it might be best to leave this unbounded.
 Let the autoscalar and loadbalancer deal with it. 
 """
 
-# Debug configuration
-DEBUG = os.getenv("DEBUG", "False").lower() == "true" or int(os.getenv("DEBUG", "0"))==1
+# Debug / info configuration
+# DEBUG: verbose (includes per-item task dumps / content-ish traces)
+# INFO:  stage timings only — use to find workflow bottlenecks without content
+# neither: WARNING+
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name, "0")
+    return raw.lower() in {"1", "true", "yes"} or (raw.isdigit() and int(raw) == 1)
 
 
-logging.basicConfig(level=logging.DEBUG if DEBUG else logging.WARNING)
+DEBUG = _env_flag("DEBUG")
+INFO = _env_flag("INFO") or DEBUG
+
+if DEBUG:
+    _log_level = logging.DEBUG
+elif INFO:
+    _log_level = logging.INFO
+else:
+    _log_level = logging.WARNING
+
+logging.basicConfig(level=_log_level)
 
 WORKER_LOG_SPLIT = "*" * 40
 
