@@ -316,12 +316,14 @@ class MetaMap(Process):
         func: Callable[[Value], Value],
         many: bool = True,
         name: Union[None, str] = None,
+        inflight_batch: int = DEFAULT_BATCH,
     ):
         """Creates a map process.
 
         Args:
             func (function): async function to apply.
             many (bool): If true does a flatMap. Defaults to True.
+            inflight_batch (int): Max concurrent in-flight items for this map.
         """
 
         if name is None:
@@ -329,6 +331,7 @@ class MetaMap(Process):
 
         super().__init__(name)
         self.func = func
+        self.inflight_batch = max(1, int(inflight_batch))
         if many:  # for flatMaps
             self.func_applier = func_applier_many
         else:
@@ -345,7 +348,7 @@ class MetaMap(Process):
             bool : True if sucefull.
         """
 
-        inflight = Queue(maxsize=DEFAULT_BATCH)
+        inflight = Queue(maxsize=self.inflight_batch)
 
         logging.debug(f"Launching task: {self.name}")
         timing = StageTiming(self.name)
@@ -741,17 +744,24 @@ class NativeMap(MetaMap):
         func: Callable[[Value], Value],
         name: Union[str, None] = None,
         many: bool = False,
+        inflight_batch: int = DEFAULT_BATCH,
     ):
         """Create a native map process.
 
         Args:
             func (function): Function to be applied.
             many (bool): Whether to do a flat map or not.
+            inflight_batch (int): Max concurrent in-flight items for this map.
         """
 
         _func = async_wrap(func)
 
-        super().__init__(func=_func, many=many, name=name)
+        super().__init__(
+            func=_func,
+            many=many,
+            name=name,
+            inflight_batch=inflight_batch,
+        )
 
 
 class Map(NativeMap):
@@ -760,15 +770,26 @@ class Map(NativeMap):
     It's a Native map with many=False.
     """
 
-    def __init__(self, func: Callable[[Value], Value], name=None):
+    def __init__(
+        self,
+        func: Callable[[Value], Value],
+        name=None,
+        inflight_batch: int = DEFAULT_BATCH,
+    ):
         """Creates a classic map process.
 
         Args:
             func (function): Function to be applied.
+            inflight_batch (int): Max concurrent in-flight items for this map.
         """
         if name is None:
             name = "map({})".format(format_function(func))
-        super().__init__(func=func, name=name, many=False)
+        super().__init__(
+            func=func,
+            name=name,
+            many=False,
+            inflight_batch=inflight_batch,
+        )
 
 
 class FlatMap(NativeMap):
@@ -789,6 +810,9 @@ class ProcessNativeMap(MetaMap):
     Unlike :class:`NativeMap`, this serializes callbacks with ``cloudpickle`` so
     work runs in separate Python processes and can use multiple CPU cores.
     Inputs and return values must be transferable through process-pool IPC.
+
+    ``inflight_batch`` (typically workflow ``batch_size``) may exceed the shared
+    pool's CPU-default ``max_workers``; excess submissions queue in the pool.
     """
 
     def __init__(
@@ -796,19 +820,35 @@ class ProcessNativeMap(MetaMap):
         func: Callable[[Value], Value],
         name: Union[str, None] = None,
         many: bool = False,
+        inflight_batch: int = DEFAULT_BATCH,
     ):
         if name is None:
             name = f"process_map:{format_function(func)}"
-        super().__init__(func=process_wrap(func), many=many, name=name)
+        super().__init__(
+            func=process_wrap(func),
+            many=many,
+            name=name,
+            inflight_batch=inflight_batch,
+        )
 
 
 class ProcessMap(ProcessNativeMap):
     """A one-to-one CPU-bound map executed in the shared process pool."""
 
-    def __init__(self, func: Callable[[Value], Value], name=None):
+    def __init__(
+        self,
+        func: Callable[[Value], Value],
+        name=None,
+        inflight_batch: int = DEFAULT_BATCH,
+    ):
         if name is None:
             name = "process_map({})".format(format_function(func))
-        super().__init__(func=func, name=name, many=False)
+        super().__init__(
+            func=func,
+            name=name,
+            many=False,
+            inflight_batch=inflight_batch,
+        )
 
 
 class ProcessFlatMap(ProcessNativeMap):
@@ -818,10 +858,16 @@ class ProcessFlatMap(ProcessNativeMap):
         self,
         func: Callable[[Value], List[Value]],
         name: Union[str, None] = None,
+        inflight_batch: int = DEFAULT_BATCH,
     ):
         if name is None:
             name = "process_flat_map({})".format(format_function(func))
-        super().__init__(func=func, name=name, many=True)
+        super().__init__(
+            func=func,
+            name=name,
+            many=True,
+            inflight_batch=inflight_batch,
+        )
 
 
 class RemoteMap(MetaMap):
@@ -989,33 +1035,53 @@ class TqdmProgressState:
         desc: str = "Generation workflow",
         unit: str = "row",
         disable: bool = False,
+        position: int | None = None,
+        leave: bool = True,
     ) -> None:
         self.desc = desc
         self.unit = unit
         self.disable = disable
+        self.position = position
+        self.leave = leave
         self._lock = Lock()
         self._pbar: Any | None = None
         self._total: int | None = None
 
-    def start(self, total: int) -> None:
+    def start(self, total: int | None = None) -> None:
         with self._lock:
             if self._pbar is not None:
                 self._pbar.close()
             self._total = total
-            self._pbar = tqdm(
-                total=total,
-                desc=self.desc,
-                unit=self.unit,
-                disable=self.disable,
-            )
+            kwargs: dict[str, Any] = {
+                "total": total,
+                "desc": self.desc,
+                "unit": self.unit,
+                "disable": self.disable,
+                "leave": self.leave,
+            }
+            if self.position is not None:
+                kwargs["position"] = self.position
+            self._pbar = tqdm(**kwargs)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._pbar is not None:
+                # Finish the bar cleanly when the stage ends early (fewer active
+                # items than the batch total).
+                if self._pbar.total is None or self._pbar.n < self._pbar.total:
+                    self._pbar.total = max(self._pbar.n, 0)
+                    self._pbar.refresh()
+                self._pbar.close()
+                self._pbar = None
 
     def update(self) -> None:
         with self._lock:
-            if self._pbar is not None:
-                self._pbar.update(1)
-                if self._total is not None and self._pbar.n >= self._total:
-                    self._pbar.close()
-                    self._pbar = None
+            if self._pbar is None:
+                return
+            self._pbar.update(1)
+            if self._total is not None and self._pbar.n >= self._total:
+                self._pbar.close()
+                self._pbar = None
 
 
 class TqdmProgressMap(MetaMap):
@@ -1024,14 +1090,22 @@ class TqdmProgressMap(MetaMap):
         state: TqdmProgressState,
         *,
         name: str,
+        inflight_batch: int = DEFAULT_BATCH,
     ) -> None:
         self.state = state
         super().__init__(
             func=self._progress_impl,
             name=name,
             many=False,
+            inflight_batch=inflight_batch,
         )
 
     async def _progress_impl(self, data: dict[str, Any]) -> dict[str, Any]:
         self.state.update()
         return data
+
+    async def execute(self, input: Actor, output: Actor) -> bool:
+        try:
+            return await super().execute(input, output)
+        finally:
+            self.state.close()

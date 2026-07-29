@@ -21,8 +21,11 @@ def _run_cloudpickled_call(payload):
 def get_process_pool():
     """Return the shared, lazily-created process pool for CPU map stages.
 
-    The pool uses Python's default ``ProcessPoolExecutor`` worker count and the
-    ``spawn`` start method so workers do not inherit event-loop or network state.
+    The pool uses Python's default ``ProcessPoolExecutor`` worker count (CPU-based)
+    and the ``spawn`` start method so workers do not inherit event-loop or network
+    state. MetaMap ``inflight_batch`` (e.g. workflow ``batch_size``) may exceed
+    this worker count; excess work simply queues in the pool.
+
     Call :func:`shutdown_process_pool` during application teardown when a
     long-lived host no longer needs CPU map stages.
     """
@@ -33,6 +36,11 @@ def get_process_pool():
                 mp_context=multiprocessing.get_context("spawn")
             )
         return _process_pool
+
+
+def get_process_pool_max_workers():
+    """Return the shared process pool's worker count (creating the pool if needed)."""
+    return get_process_pool()._max_workers
 
 
 def shutdown_process_pool(wait=True):

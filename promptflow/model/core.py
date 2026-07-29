@@ -2,6 +2,7 @@ from transformers import AutoTokenizer
 import requests
 import aiohttp
 import asyncio
+import json
 import os
 from typing import Any, Union
 import logging
@@ -20,24 +21,42 @@ class LLMResponse:
     output: str
     reasoning: str
     text: str
-    valid: bool=True
-    
-    
+    valid: bool = True
+    tool_call: dict[str, Any] | None = None
+
     def __init__(self, response: str):
         self.reasoning, self.output = parse_thinking_tokens_qwen(response)
-        self.text=response
+        self.text = response
+        self.tool_call = None
 
     def __str__(self):
         return f"LLMResponse(reasoning={self.reasoning}, output={self.output})"
-    
+
     def __repr__(self):
         return f"LLMResponse(reasoning={self.reasoning}, output={self.output})"
-    
+
     def make_invalid(self):
         self.valid = False
         return self
-        
-    
+
+
+class ToolLLMResponse(LLMResponse):
+    """Provider-neutral response carrying one normalized native tool call."""
+
+    def __init__(
+        self,
+        response: str = "",
+        *,
+        reasoning: str = "",
+        tool_call: dict[str, Any] | None = None,
+        raw_choice: Any = None,
+    ):
+        super().__init__(response)
+        self.text = response or ""
+        self.output = response or ""
+        self.reasoning = reasoning or ""
+        self.tool_call = tool_call
+        self.raw_choice = raw_choice
 
 class Assertion:
     def check(self, response: LLMResponse) -> bool:
@@ -328,7 +347,7 @@ class RemoteLLMClient:
 
 class ChatGPTClient:
     """Client for OpenAI's ChatGPT API using the official Python library."""
-    
+
     def __init__(
         self,
         api_key: str = None,
@@ -339,9 +358,11 @@ class ChatGPTClient:
         max_retries: int = 15,
         max_concurrent_requests: int = 64,
         base_url: str = None,
+        tools: list[dict[str, Any]] | None = None,
+        reasoning_effort: str | None = None,
     ):
         """Initialize ChatGPT client.
-        
+
         Args:
             api_key: OpenAI API key. If None, reads from OPENAI_API_KEY env variable.
             model: Model name (e.g., "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo").
@@ -351,13 +372,16 @@ class ChatGPTClient:
             max_retries: Maximum number of retry attempts.
             max_concurrent_requests: Maximum concurrent API requests.
             base_url: Base URL for OpenAI API (useful for Azure or proxies).
+            reasoning_effort: Optional effort for reasoning models. When function
+                tools are used with gpt-5.6+ on ``/v1/chat/completions``, OpenAI
+                requires ``none`` (or the Responses API).
         """
         from openai import AsyncOpenAI
-        
+
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("API key must be provided or set via OPENAI_API_KEY environment variable")
-        
+
         self.model = model
         self.model_path = model  # Alias for compatibility with RemoteLLMClient
         self.max_new_tokens = max_new_tokens
@@ -365,7 +389,11 @@ class ChatGPTClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.max_concurrent_requests = max_concurrent_requests
-        
+        self.tools = self._openai_tools(tools)
+        self.reasoning_effort = (
+            str(reasoning_effort).strip().lower() if reasoning_effort else None
+        )
+
         # Initialize the async OpenAI client
         self.client = AsyncOpenAI(
             api_key=self.api_key,
@@ -373,10 +401,95 @@ class ChatGPTClient:
             timeout=timeout,
             max_retries=max_retries,
         )
-        
+
         if DEBUG:
             print(f"ChatGPTClient initialized with model: {self.model}")
-    
+
+    @staticmethod
+    def _openai_tools(
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        if not tools:
+            return None
+        converted: list[dict[str, Any]] = []
+        for tool in tools:
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                converted.append(tool)
+            elif tool.get("name"):
+                converted.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description") or "",
+                            "parameters": tool.get("parameters")
+                            or {"type": "object", "properties": {}},
+                        },
+                    }
+                )
+        return converted or None
+
+    def _chat_completions_reasoning_effort(self) -> str | None:
+        """Resolve reasoning_effort for ``/v1/chat/completions``.
+
+        gpt-5.6+ applies a default effort server-side. Function tools are only
+        allowed on chat completions when that effort is explicitly ``none``.
+        """
+        effort = self.reasoning_effort
+        if self.tools is None:
+            return effort
+        model = self.model.lower()
+        needs_none = "gpt-5.6" in model or model.startswith("o3") or model.startswith("o4")
+        if not needs_none:
+            return effort
+        if effort and effort != "none":
+            logging.warning(
+                "ChatGPTClient: forcing reasoning_effort='none' for %s with "
+                "function tools on /v1/chat/completions (requested %r). "
+                "Use the Responses API to keep non-none effort with tools.",
+                self.model,
+                effort,
+            )
+        return "none"
+
+    @staticmethod
+    def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            role = str(message.get("role") or "user")
+            content = message.get("content")
+            if role == "assistant" and isinstance(message.get("tool_call"), dict):
+                call = message["tool_call"]
+                arguments = call.get("arguments") or {}
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                converted.append(
+                    {
+                        "role": "assistant",
+                        "content": content or "",
+                        "tool_calls": [
+                            {
+                                "id": str(call.get("id") or f"call_{index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": str(call["name"]),
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif role == "tool":
+                item = {"role": "tool", "content": content or ""}
+                if message.get("tool_call_id"):
+                    item["tool_call_id"] = str(message["tool_call_id"])
+                if message.get("name"):
+                    item["name"] = str(message["name"])
+                converted.append(item)
+            else:
+                converted.append({"role": role, "content": content or ""})
+        return converted
+
     async def _make_request_with_semaphore(self, semaphore, messages, n=1):
         """Make a single API request with semaphore for concurrency control."""
         async with semaphore:
@@ -388,37 +501,74 @@ class ChatGPTClient:
                     #"temperature": self.temperature,
                     "n": n,
                 }
-                
-                if self.stop_tokens:
+
+                # GPT-5 family Chat Completions rejects the legacy ``stop``
+                # parameter. Tool workflows use provider-native termination
+                # instead of renderer stop tokens.
+                if self.stop_tokens and not self.model.lower().startswith("gpt-5"):
                     kwargs["stop"] = self.stop_tokens
-                
+                if self.tools is not None:
+                    kwargs["tools"] = self.tools
+                    kwargs["tool_choice"] = "auto"
+                effort = self._chat_completions_reasoning_effort()
+                if effort is not None:
+                    kwargs["reasoning_effort"] = effort
+
                 response = await self.client.chat.completions.create(**kwargs)
                 return response
             except Exception as e:
                 raise RuntimeError(f"ChatGPT API request failed: {e}")
-    
+
     async def invoke(self, chat_template_prompt, n=1) -> list:
         """
         Invoke the ChatGPT API with a chat template prompt.
-        
+
         Args:
-            chat_template_prompt: List of message dicts, e.g., 
+            chat_template_prompt: List of message dicts, e.g.,
                 [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}]
             n: Number of completions to generate per request.
-            
+
         Returns:
             List of LLMResponse objects.
         """
+        if not isinstance(chat_template_prompt, list):
+            raise TypeError(
+                "ChatGPTClient expects canonical OpenAI-style message dictionaries"
+            )
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
-        response = await self._make_request_with_semaphore(semaphore, chat_template_prompt, n=n)
- 
-        completions = [
-            LLMResponse(response=choice.message.content)
-            for choice in response.choices
-        ]
+        response = await self._make_request_with_semaphore(
+            semaphore, self._openai_messages(chat_template_prompt), n=n
+        )
+
+        completions = []
+        for choice in response.choices:
+            message = choice.message
+            tool_call = None
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if tool_calls:
+                first = tool_calls[0]
+                function = getattr(first, "function", None)
+                arguments = getattr(function, "arguments", "{}")
+                try:
+                    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except json.JSONDecodeError:
+                    pass
+                tool_call = {
+                    "name": str(getattr(function, "name", "")),
+                    "arguments": arguments,
+                    "id": getattr(first, "id", None),
+                }
+            completions.append(
+                ToolLLMResponse(
+                    getattr(message, "content", None) or "",
+                    reasoning=getattr(message, "reasoning_content", "") or "",
+                    tool_call=tool_call,
+                    raw_choice=choice,
+                )
+            )
 
         return completions
-    
+
     def __str__(self):
         return f"ChatGPTClient(model={self.model})"
 
@@ -449,7 +599,6 @@ class LLMMap(MetaMap):
         # Store instance variables first
         self.vllm_client = vllm_client
         self.n = n
-        self.inflight_batch = inflight_batch
         self.input_key = input_key
         self.output_key = output_key
         self.assertions = assertions
@@ -457,8 +606,14 @@ class LLMMap(MetaMap):
         if name is None:
             name = f"VLLMMap:{vllm_client.model_path}:ancestral"
 
-        # Initialize parent with the async function
-        super().__init__(func=self._vllm_process_impl, name=name, many=False)
+        # Initialize parent with the async function; MetaMap.execute honors
+        # inflight_batch as the concurrent-item queue bound.
+        super().__init__(
+            func=self._vllm_process_impl,
+            name=name,
+            many=False,
+            inflight_batch=inflight_batch,
+        )
 
     async def _vllm_process_impl(
         self, data: Any,

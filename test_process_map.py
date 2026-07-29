@@ -52,6 +52,24 @@ def test_process_pool_is_shared():
     assert get_process_pool() is get_process_pool()
 
 
+def test_process_pool_uses_cpu_default_workers():
+    from concurrent.futures import ProcessPoolExecutor
+
+    from promptflow.asynchronous import get_process_pool_max_workers
+
+    shutdown_process_pool()
+    # Match ProcessPoolExecutor's CPU-based default (not batch_size / not inflated).
+    with ProcessPoolExecutor() as reference:
+        expected = reference._max_workers
+    assert get_process_pool_max_workers() == expected
+
+
+def test_process_map_accepts_batch_size_inflight():
+    # MetaMap inflight may exceed the CPU-sized pool; work queues in the pool.
+    process_map = ProcessMap(add_one, inflight_batch=64)
+    assert process_map.inflight_batch == 64
+
+
 def test_process_map_matches_native_map_semantics():
     workflow = SingleStageWorkflow(ProcessMap(add_one))
 
